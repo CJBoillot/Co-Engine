@@ -38,7 +38,7 @@ const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.9";
+const CO_VERSION: &str = "0.0.10";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -746,15 +746,32 @@ enum Tab {
     Code,
 }
 
+/// Which Settings category/submenu is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsTab {
+    Theme,
+    Controls,
+}
+
 /// UI/chrome state: theme, menu/modal visibility, active tab, controls overlay.
 struct UiState {
     theme: Theme,
     dark_mode: bool,
     menu_open: bool,
     settings_open: bool,
+    /// Which Settings submenu (Theme / Controls) is showing.
+    settings_tab: SettingsTab,
     show_debug: bool,
     active_tab: Tab,
     should_quit: bool,
+    /// When Some, the next key press rebinds this action (Settings -> Controls).
+    rebinding: Option<ControlAction>,
+    /// Right-side panel visibility (toggled from the tool row).
+    chat_open: bool,
+    log_open: bool,
+    /// One-shot requests raised by the Log panel's Undo / Redo buttons.
+    undo_requested: bool,
+    redo_requested: bool,
 }
 
 impl Default for UiState {
@@ -764,9 +781,15 @@ impl Default for UiState {
             dark_mode: true,
             menu_open: false,
             settings_open: false,
+            settings_tab: SettingsTab::Theme,
             show_debug: true,
             active_tab: Tab::Scene,
             should_quit: false,
+            rebinding: None,
+            chat_open: true,
+            log_open: true,
+            undo_requested: false,
+            redo_requested: false,
         }
     }
 }
@@ -912,6 +935,9 @@ fn build_ui(
     mode: CameraMode,
     logo: Option<&egui::TextureHandle>,
     scene: &SceneSnapshot,
+    controls: &Controls,
+    history: &[HistoryEntry],
+    history_cursor: usize,
 ) {
     // Apply the selected theme + mode (UI only — the 3D background is fixed).
     ctx.set_visuals(theme_visuals(ui_state.theme, ui_state.dark_mode));
@@ -945,16 +971,31 @@ fn build_ui(
         ui.add_space(2.0);
     });
 
-    // Tool row (blank placeholder for now).
+    // Tool row: panel toggles (scene tools will live here later).
     egui::TopBottomPanel::top("tool_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             ui.label(egui::RichText::new("Tools").small());
+            ui.separator();
+            ui.label(egui::RichText::new("Panels:").small());
+            ui.toggle_value(&mut ui_state.chat_open, "AI Chat");
+            ui.toggle_value(&mut ui_state.log_open, "Log");
         });
     });
 
-    // Right-side chat panel.
-    build_chat_panel(ctx, chat, scene);
+    // Right-side panels: Chat (rightmost) + Log column just to its left.
+    if ui_state.chat_open {
+        build_chat_panel(ctx, chat, scene);
+    }
+    if ui_state.log_open {
+        build_log_panel(
+            ctx,
+            history,
+            history_cursor,
+            &mut ui_state.undo_requested,
+            &mut ui_state.redo_requested,
+        );
+    }
 
     // Tab content. The 3D Scene tab leaves the central area empty so the wgpu
     // viewport shows through; other tabs cover it with a placeholder.
@@ -993,22 +1034,37 @@ fn build_ui(
                         let dim = egui::Color32::from_rgb(168, 163, 148);
                         let cam = match mode {
                             CameraMode::Orbit => {
-                                "Orbit:  drag = orbit · R-drag = pan · scroll = zoom"
+                                "Orbit:  drag = orbit · R-drag = pan · scroll = zoom".to_string()
                             }
-                            CameraMode::Fly => "Fly:  WASD move · E/Q up/down · R-drag = look",
+                            CameraMode::Fly => format!(
+                                "Fly:  {}{}{}{} move · {}/{} up/down · R-drag = look",
+                                key_label(controls.forward),
+                                key_label(controls.left),
+                                key_label(controls.back),
+                                key_label(controls.right),
+                                key_label(controls.up),
+                                key_label(controls.down),
+                            ),
                         };
                         ui.label(egui::RichText::new(cam).color(text).small());
                         ui.label(
-                            egui::RichText::new(
-                                "click = select · C = add cube · Del = remove · Tab = orbit/fly",
-                            )
+                            egui::RichText::new(format!(
+                                "click = select · {} = add cube · {} = remove · {} = orbit/fly",
+                                key_label(controls.add_cube),
+                                key_label(controls.remove),
+                                key_label(controls.toggle_camera),
+                            ))
                             .color(text)
                             .small(),
                         );
                         ui.label(
-                            egui::RichText::new("Esc = menu · H = hide debug info")
-                                .color(dim)
-                                .small(),
+                            egui::RichText::new(format!(
+                                "{} = menu · {} = hide debug info",
+                                key_label(controls.toggle_menu),
+                                key_label(controls.toggle_debug),
+                            ))
+                            .color(dim)
+                            .small(),
                         );
                         ui.label(
                             egui::RichText::new(format!("CoEngine v{CO_VERSION}"))
@@ -1080,25 +1136,151 @@ fn build_ui(
             .resizable(false)
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(egui::vec2(580.0, 300.0))
             .show(ctx, |ui| {
-                ui.set_min_width(260.0);
-                ui.label("Theme");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut ui_state.theme, Theme::DefaultSimple, "Default Simple");
-                    ui.selectable_value(&mut ui_state.theme, Theme::Barbarian, "Barbarian");
+                ui.horizontal_top(|ui| {
+                    // Left category nav.
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.selectable_value(
+                            &mut ui_state.settings_tab,
+                            SettingsTab::Theme,
+                            "Theme",
+                        );
+                        ui.selectable_value(
+                            &mut ui_state.settings_tab,
+                            SettingsTab::Controls,
+                            "Controls",
+                        );
+                    });
+                    ui.add_space(14.0);
+                    // Content for the selected category.
+                    ui.vertical(|ui| {
+                        match ui_state.settings_tab {
+                            SettingsTab::Theme => {
+                                ui.label("Theme");
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(
+                                        &mut ui_state.theme,
+                                        Theme::DefaultSimple,
+                                        "Default Simple",
+                                    );
+                                    ui.selectable_value(
+                                        &mut ui_state.theme,
+                                        Theme::Barbarian,
+                                        "Barbarian",
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                ui.label("Mode (UI only — does not affect the 3D view)");
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut ui_state.dark_mode, true, "Dark");
+                                    ui.selectable_value(&mut ui_state.dark_mode, false, "Light");
+                                });
+                            }
+                            SettingsTab::Controls => {
+                                ui.label("Click a key to rebind");
+                                egui::Grid::new("controls_grid")
+                                    .num_columns(4)
+                                    .spacing([12.0, 4.0])
+                                    .show(ui, |ui| {
+                                        // Two actions per row to keep the panel short.
+                                        for pair in CONTROL_ACTIONS.chunks(2) {
+                                            for &(action, label) in pair {
+                                                ui.label(label);
+                                                let active = ui_state.rebinding == Some(action);
+                                                let txt = if active {
+                                                    "press…".to_string()
+                                                } else {
+                                                    key_label(controls.key(action))
+                                                };
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(txt)
+                                                            .min_size(egui::vec2(80.0, 0.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ui_state.rebinding =
+                                                        if active { None } else { Some(action) };
+                                                }
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                                if ui_state.rebinding.is_some() {
+                                    ui.label(
+                                        egui::RichText::new("Press any key to bind · Esc to cancel")
+                                            .small()
+                                            .italics(),
+                                    );
+                                }
+                            }
+                        }
+                    });
                 });
-                ui.add_space(6.0);
-                ui.label("Mode (UI only — does not affect the 3D view)");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut ui_state.dark_mode, true, "Dark");
-                    ui.selectable_value(&mut ui_state.dark_mode, false, "Light");
-                });
+                // Pin Close to the bottom so the layout is identical for every submenu.
+                let pad = (ui.available_height() - 30.0).max(0.0);
+                ui.add_space(pad);
                 ui.separator();
                 if ui.button("Close").clicked() {
                     ui_state.settings_open = false;
+                    ui_state.rebinding = None;
                 }
             });
     }
+}
+
+/// Build the Log column: the running action log + Undo / Redo for the session.
+fn build_log_panel(
+    ctx: &egui::Context,
+    history: &[HistoryEntry],
+    cursor: usize,
+    undo_req: &mut bool,
+    redo_req: &mut bool,
+) {
+    egui::SidePanel::right("log_panel")
+        .resizable(true)
+        .default_width(240.0)
+        .show(ctx, |ui| {
+            egui::TopBottomPanel::top("log_header").show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                ui.heading("Log");
+                ui.horizontal(|ui| {
+                    let can_undo = cursor > 0;
+                    let can_redo = cursor + 1 < history.len();
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new("Undo"))
+                        .clicked()
+                    {
+                        *undo_req = true;
+                    }
+                    if ui
+                        .add_enabled(can_redo, egui::Button::new("Redo"))
+                        .clicked()
+                    {
+                        *redo_req = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for (i, entry) in history.iter().enumerate() {
+                            let mut rt = egui::RichText::new(&entry.label).small();
+                            if i == cursor {
+                                rt = rt.strong().color(ACCENT_GOLD);
+                            } else if i > cursor {
+                                rt = rt.weak();
+                            }
+                            ui.label(rt);
+                        }
+                    });
+            });
+        });
 }
 
 /// Build the right-side chat panel.
@@ -1109,7 +1291,7 @@ fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi, scene: &SceneSnapsho
         .show(ctx, |ui| {
             egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
                 ui.add_space(6.0);
-                ui.heading("Chat");
+                ui.heading("AI Chat");
                 if !chat.status.is_empty() {
                     ui.label(egui::RichText::new(&chat.status).small().italics());
                 }
@@ -1311,6 +1493,126 @@ struct Keys {
     down: bool,
 }
 
+/// One remappable input action.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlAction {
+    Forward,
+    Back,
+    Left,
+    Right,
+    Up,
+    Down,
+    AddCube,
+    Remove,
+    ToggleDebug,
+    ToggleMenu,
+    ToggleCamera,
+}
+
+/// All actions + display labels, in the order they appear in Settings.
+const CONTROL_ACTIONS: &[(ControlAction, &str)] = &[
+    (ControlAction::Forward, "Move forward"),
+    (ControlAction::Back, "Move back"),
+    (ControlAction::Left, "Move left"),
+    (ControlAction::Right, "Move right"),
+    (ControlAction::Up, "Move up"),
+    (ControlAction::Down, "Move down"),
+    (ControlAction::AddCube, "Add cube"),
+    (ControlAction::Remove, "Remove selected"),
+    (ControlAction::ToggleDebug, "Toggle debug info"),
+    (ControlAction::ToggleMenu, "Open / close menu"),
+    (ControlAction::ToggleCamera, "Toggle camera mode"),
+];
+
+/// The current key bound to each action. Remappable in Settings -> Controls.
+#[derive(Clone, Copy)]
+struct Controls {
+    forward: KeyCode,
+    back: KeyCode,
+    left: KeyCode,
+    right: KeyCode,
+    up: KeyCode,
+    down: KeyCode,
+    add_cube: KeyCode,
+    remove: KeyCode,
+    toggle_debug: KeyCode,
+    toggle_menu: KeyCode,
+    toggle_camera: KeyCode,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self {
+            forward: KeyCode::KeyW,
+            back: KeyCode::KeyS,
+            left: KeyCode::KeyA,
+            right: KeyCode::KeyD,
+            up: KeyCode::KeyE,
+            down: KeyCode::KeyQ,
+            add_cube: KeyCode::KeyC,
+            remove: KeyCode::Delete,
+            toggle_debug: KeyCode::KeyH,
+            toggle_menu: KeyCode::Escape,
+            toggle_camera: KeyCode::Tab,
+        }
+    }
+}
+
+impl Controls {
+    fn key(&self, a: ControlAction) -> KeyCode {
+        match a {
+            ControlAction::Forward => self.forward,
+            ControlAction::Back => self.back,
+            ControlAction::Left => self.left,
+            ControlAction::Right => self.right,
+            ControlAction::Up => self.up,
+            ControlAction::Down => self.down,
+            ControlAction::AddCube => self.add_cube,
+            ControlAction::Remove => self.remove,
+            ControlAction::ToggleDebug => self.toggle_debug,
+            ControlAction::ToggleMenu => self.toggle_menu,
+            ControlAction::ToggleCamera => self.toggle_camera,
+        }
+    }
+
+    fn set(&mut self, a: ControlAction, k: KeyCode) {
+        match a {
+            ControlAction::Forward => self.forward = k,
+            ControlAction::Back => self.back = k,
+            ControlAction::Left => self.left = k,
+            ControlAction::Right => self.right = k,
+            ControlAction::Up => self.up = k,
+            ControlAction::Down => self.down = k,
+            ControlAction::AddCube => self.add_cube = k,
+            ControlAction::Remove => self.remove = k,
+            ControlAction::ToggleDebug => self.toggle_debug = k,
+            ControlAction::ToggleMenu => self.toggle_menu = k,
+            ControlAction::ToggleCamera => self.toggle_camera = k,
+        }
+    }
+}
+
+/// Human-friendly label for a key (KeyW -> "W", Digit1 -> "1", else Debug name).
+fn key_label(code: KeyCode) -> String {
+    let raw = format!("{code:?}");
+    if let Some(rest) = raw.strip_prefix("Key") {
+        rest.to_string()
+    } else if let Some(rest) = raw.strip_prefix("Digit") {
+        rest.to_string()
+    } else {
+        raw
+    }
+}
+
+/// One entry in the session action log / undo history: a label plus the full
+/// scene snapshot taken right after that action.
+#[derive(Clone)]
+struct HistoryEntry {
+    label: String,
+    cubes: Vec<Cube>,
+    selected: Option<usize>,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct CameraUniform {
@@ -1365,6 +1667,7 @@ struct State {
     mode: CameraMode,
 
     keys: Keys,
+    controls: Controls,
     mouse_left_down: bool,
     mouse_right_down: bool,
     cursor_pos: (f32, f32),
@@ -1376,6 +1679,9 @@ struct State {
     egui_renderer: egui_wgpu::Renderer,
     chat: ChatUi,
     ui: UiState,
+    /// Session action log + undo/redo history (newest last; cursor = current state).
+    history: Vec<HistoryEntry>,
+    history_cursor: usize,
     /// The CoE logo as an egui texture (None if assets/icon.png is missing).
     logo_texture: Option<egui::TextureHandle>,
 }
@@ -1597,6 +1903,7 @@ impl State {
             fly,
             mode,
             keys: Keys::default(),
+            controls: Controls::default(),
             mouse_left_down: false,
             mouse_right_down: false,
             cursor_pos: (0.0, 0.0),
@@ -1611,6 +1918,12 @@ impl State {
                 ..Default::default()
             },
             ui: UiState::default(),
+            history: vec![HistoryEntry {
+                label: "Session start".to_string(),
+                cubes: Vec::new(),
+                selected: None,
+            }],
+            history_cursor: 0,
             logo_texture,
         }
     }
@@ -1651,6 +1964,7 @@ impl State {
             color: CUBE_BASE_COLOR,
         });
         self.rebuild_cubes();
+        self.record_history("Add cube");
     }
 
     fn rebuild_cubes(&mut self) {
@@ -1710,8 +2024,47 @@ impl State {
             }
             self.selected = None;
             self.rebuild_cubes();
+            self.record_history("Remove cube");
             println!("Removed cube; {} remain", self.cubes.len());
         }
+    }
+
+    /// Push a snapshot of the current scene onto the history (dropping any redo tail).
+    fn record_history(&mut self, label: impl Into<String>) {
+        self.history.truncate(self.history_cursor + 1);
+        self.history.push(HistoryEntry {
+            label: label.into(),
+            cubes: self.cubes.clone(),
+            selected: self.selected,
+        });
+        const MAX_HISTORY: usize = 100;
+        if self.history.len() > MAX_HISTORY {
+            let drop = self.history.len() - MAX_HISTORY;
+            self.history.drain(0..drop);
+        }
+        self.history_cursor = self.history.len() - 1;
+    }
+
+    fn history_undo(&mut self) {
+        if self.history_cursor > 0 {
+            self.history_cursor -= 1;
+            self.restore_history();
+        }
+    }
+
+    fn history_redo(&mut self) {
+        if self.history_cursor + 1 < self.history.len() {
+            self.history_cursor += 1;
+            self.restore_history();
+        }
+    }
+
+    /// Restore the scene to the snapshot at the current history cursor.
+    fn restore_history(&mut self) {
+        let entry = self.history[self.history_cursor].clone();
+        self.cubes = entry.cubes;
+        self.selected = entry.selected;
+        self.rebuild_cubes();
     }
 
     fn toggle_mode(&mut self) {
@@ -1738,6 +2091,14 @@ impl State {
     }
 
     fn update(&mut self) {
+        // Undo / Redo requested from the Log panel during the previous frame.
+        if std::mem::take(&mut self.ui.undo_requested) {
+            self.history_undo();
+        }
+        if std::mem::take(&mut self.ui.redo_requested) {
+            self.history_redo();
+        }
+
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -1803,17 +2164,21 @@ impl State {
             }
         }
 
-        // Apply scene commands the agent issued.
+        // Apply scene commands the agent issued (each scene change is recorded for undo).
         if !commands.is_empty() {
             for cmd in commands {
                 match cmd {
-                    SceneCommand::Add { x, z, color } => self.cubes.push(Cube {
-                        pos: Vec3::new(x, CUBE_HALF, z),
-                        color,
-                    }),
+                    SceneCommand::Add { x, z, color } => {
+                        self.cubes.push(Cube {
+                            pos: Vec3::new(x, CUBE_HALF, z),
+                            color,
+                        });
+                        self.record_history("CoE-AI: add cube");
+                    }
                     SceneCommand::SetColor { index, color } => {
                         if index < self.cubes.len() {
                             self.cubes[index].color = color;
+                            self.record_history("CoE-AI: recolor cube");
                         }
                     }
                     SceneCommand::Remove { index } => {
@@ -1824,6 +2189,7 @@ impl State {
                                 Some(s) if s > index => Some(s - 1),
                                 other => other,
                             };
+                            self.record_history("CoE-AI: remove cube");
                         }
                     }
                     SceneCommand::Select { index } => {
@@ -1834,6 +2200,7 @@ impl State {
                     SceneCommand::Clear => {
                         self.cubes.clear();
                         self.selected = None;
+                        self.record_history("CoE-AI: clear scene");
                     }
                 }
             }
@@ -1955,8 +2322,22 @@ impl State {
         };
         let chat = &mut self.chat;
         let ui_state = &mut self.ui;
-        let full_output =
-            ctx.run(raw_input, |c| build_ui(c, ui_state, chat, mode, logo, &scene));
+        let controls = &self.controls;
+        let history = &self.history;
+        let history_cursor = self.history_cursor;
+        let full_output = ctx.run(raw_input, |c| {
+            build_ui(
+                c,
+                ui_state,
+                chat,
+                mode,
+                logo,
+                &scene,
+                controls,
+                history,
+                history_cursor,
+            )
+        });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -2105,10 +2486,32 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
-        // Tab toggles camera mode; swallow it so egui can't focus the chat with it.
+        // While rebinding a control, the next key press is captured for that action
+        // (Esc cancels). Done before egui so any key — even Tab — can be bound.
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            if let Some(action) = state.ui.rebinding {
+                if ke.state == ElementState::Pressed && !ke.repeat {
+                    if let PhysicalKey::Code(code) = ke.physical_key {
+                        if code == KeyCode::Escape {
+                            state.ui.rebinding = None;
+                        } else {
+                            state.controls.set(action, code);
+                            state.ui.rebinding = None;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Tab is swallowed before egui (so it can't focus-cycle into the chat box);
+        // if Tab is the camera-toggle key, toggle the camera here.
         if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
             if ke.physical_key == PhysicalKey::Code(KeyCode::Tab) {
-                if ke.state == ElementState::Pressed && !ke.repeat {
+                if ke.state == ElementState::Pressed
+                    && !ke.repeat
+                    && state.controls.toggle_camera == KeyCode::Tab
+                {
                     state.toggle_mode();
                 }
                 return;
@@ -2134,22 +2537,30 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = key_event.physical_key {
                     let pressed = key_event.state == ElementState::Pressed;
                     let first_press = pressed && !key_event.repeat;
-                    match code {
-                        KeyCode::KeyW => state.keys.forward = pressed,
-                        KeyCode::KeyS => state.keys.back = pressed,
-                        KeyCode::KeyA => state.keys.left = pressed,
-                        KeyCode::KeyD => state.keys.right = pressed,
-                        KeyCode::KeyE | KeyCode::Space => state.keys.up = pressed,
-                        KeyCode::KeyQ => state.keys.down = pressed,
-                        KeyCode::KeyC if first_press => state.add_cube(),
-                        KeyCode::Delete | KeyCode::Backspace if first_press => {
-                            state.remove_selected()
-                        }
-                        KeyCode::KeyH if first_press => {
-                            state.ui.show_debug = !state.ui.show_debug
-                        }
-                        KeyCode::Escape if first_press => state.toggle_menu(),
-                        _ => {}
+                    let c = state.controls;
+                    if code == c.forward {
+                        state.keys.forward = pressed;
+                    } else if code == c.back {
+                        state.keys.back = pressed;
+                    } else if code == c.left {
+                        state.keys.left = pressed;
+                    } else if code == c.right {
+                        state.keys.right = pressed;
+                    } else if code == c.up {
+                        state.keys.up = pressed;
+                    } else if code == c.down {
+                        state.keys.down = pressed;
+                    } else if first_press && code == c.add_cube {
+                        state.add_cube();
+                    } else if first_press && code == c.remove {
+                        state.remove_selected();
+                    } else if first_press && code == c.toggle_debug {
+                        state.ui.show_debug = !state.ui.show_debug;
+                    } else if first_press && code == c.toggle_menu {
+                        state.toggle_menu();
+                    } else if first_press && code == c.toggle_camera {
+                        // Non-Tab camera key (Tab is handled before egui above).
+                        state.toggle_mode();
                     }
                 }
             }
