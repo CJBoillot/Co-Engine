@@ -47,7 +47,7 @@ const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.14";
+const CO_VERSION: &str = "0.0.15";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -805,6 +805,8 @@ enum DockTab {
     Log,
     /// In-engine terminal (a live shell in a PTY).
     Terminal,
+    /// Git / Source Control panel.
+    Git,
     /// A file viewer opened from the Explorer; the tab is titled by file name and
     /// shows the file's text/code, or the image if it's an image.
     File(PathBuf),
@@ -1264,6 +1266,234 @@ fn terminal_tab_ui(ui: &mut egui::Ui, term: &mut TerminalState, cwd: Option<&Pat
     }
 }
 
+/// State for the Git (Source Control) dock panel.
+#[derive(Default)]
+struct GitUi {
+    commit_msg: String,
+    /// Output of the most recent operation (with a trailing status summary).
+    output: String,
+    /// Receiver for an in-flight async git operation (None = idle).
+    rx: Option<Receiver<String>>,
+    /// Wizard: desired GitHub repo name (seeded from the project folder once).
+    gh_repo_name: String,
+    /// Wizard: create the GitHub repo private (vs public).
+    gh_private: bool,
+    /// Whether `gh_repo_name` has been seeded from the folder name yet.
+    seeded: bool,
+}
+
+/// Run a program in `project`, capturing stdout+stderr as one string.
+fn run_tool(program: &str, project: &Path, args: &[&str]) -> String {
+    match std::process::Command::new(program)
+        .current_dir(project)
+        .args(args)
+        .output()
+    {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            let e = String::from_utf8_lossy(&o.stderr);
+            if !e.trim().is_empty() {
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(&e);
+            }
+            if s.trim().is_empty() {
+                s = format!("(ok: {program} {})", args.join(" "));
+            }
+            s
+        }
+        Err(e) => format!("Couldn't run {program}: {e}\n(Is {program} installed and on PATH?)"),
+    }
+}
+
+/// Run a git command in `project`.
+fn git_run(project: &Path, args: &[&str]) -> String {
+    run_tool("git", project, args)
+}
+
+/// Run `f` (one or more git commands) on a background thread, then append a short
+/// `git status -sb` summary; the result lands in `git.output` (polled in update).
+fn git_async(git: &mut GitUi, project: &Path, f: impl FnOnce(&Path) -> String + Send + 'static) {
+    let project = project.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    git.rx = Some(rx);
+    std::thread::spawn(move || {
+        let mut out = f(&project);
+        out.push_str("\n\n— status —\n");
+        out.push_str(&git_run(&project, &["status", "-sb"]));
+        let _ = tx.send(out);
+    });
+}
+
+/// Full async flow to publish the project to a new GitHub repo: init (if needed),
+/// commit, then `gh repo create … --push`.
+fn github_publish(git: &mut GitUi, project: &Path) {
+    let name = git.gh_repo_name.trim().to_string();
+    let vis = if git.gh_private { "--private" } else { "--public" };
+    git_async(git, project, move |p| {
+        let mut out = String::new();
+        if !p.join(".git").exists() {
+            out.push_str("$ git init\n");
+            out.push_str(&git_run(p, &["init"]));
+            out.push_str("\n\n");
+        }
+        out.push_str("$ git add -A\n");
+        out.push_str(&git_run(p, &["add", "-A"]));
+        out.push_str("\n\n$ git commit -m \"Initial commit\"\n");
+        out.push_str(&git_run(p, &["commit", "-m", "Initial commit"]));
+        out.push_str(&format!(
+            "\n\n$ gh repo create {name} --source=. {vis} --push\n"
+        ));
+        out.push_str(&run_tool(
+            "gh",
+            p,
+            &["repo", "create", &name, "--source=.", vis, "--push"],
+        ));
+        out
+    });
+}
+
+/// Render the Git panel: a setup wizard when the project isn't a repo (initialize
+/// locally, or create it on GitHub), and the status / commit / push panel once it
+/// is. All git/gh calls run asynchronously so the UI never freezes.
+fn git_tab_ui(ui: &mut egui::Ui, git: &mut GitUi, project: Option<&Path>) {
+    let Some(project) = project else {
+        ui.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new("Open or create a project to use Git.").weak());
+        });
+        return;
+    };
+
+    // Seed the GitHub repo-name field from the project folder name (once).
+    if !git.seeded {
+        git.gh_repo_name = project
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        git.seeded = true;
+    }
+
+    let is_repo = project.join(".git").exists();
+    // Auto-refresh status the first time the panel is shown for a repo.
+    if is_repo && git.output.is_empty() && git.rx.is_none() {
+        git_async(git, project, |p| git_run(p, &["status"]));
+    }
+    let busy = git.rx.is_some();
+
+    egui::TopBottomPanel::top("git_header").show_inside(ui, |ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading("Git");
+            if busy {
+                ui.spinner();
+                ui.label(egui::RichText::new("working…").weak());
+            }
+        });
+        ui.add_space(4.0);
+
+        if is_repo {
+            // ---- Repository controls ----
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new("Refresh")).clicked() {
+                    git_async(git, project, |p| git_run(p, &["status"]));
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Pull")).clicked() {
+                    git_async(git, project, |p| git_run(p, &["pull"]));
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Push")).clicked() {
+                    git_async(git, project, |p| git_run(p, &["push"]));
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Message:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut git.commit_msg)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Commit message"),
+                );
+            });
+            let can_commit = !busy && !git.commit_msg.trim().is_empty();
+            if ui
+                .add_enabled(can_commit, egui::Button::new("Stage all & Commit"))
+                .clicked()
+            {
+                let msg = git.commit_msg.clone();
+                git_async(git, project, move |p| {
+                    let a = git_run(p, &["add", "-A"]);
+                    let b = git_run(p, &["commit", "-m", &msg]);
+                    format!("$ git add -A\n{a}\n\n$ git commit -m \"{msg}\"\n{b}")
+                });
+                git.commit_msg.clear();
+            }
+        } else {
+            // ---- Setup wizard (not a repo yet) ----
+            ui.label(
+                egui::RichText::new("This project isn't version-controlled yet.")
+                    .color(ACCENT_GOLD),
+            );
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(!busy, egui::Button::new("Initialize local repository"))
+                .on_hover_text("git init + an initial commit")
+                .clicked()
+            {
+                git_async(git, project, |p| {
+                    let a = git_run(p, &["init"]);
+                    let b = git_run(p, &["add", "-A"]);
+                    let c = git_run(p, &["commit", "-m", "Initial commit"]);
+                    format!("$ git init\n{a}\n\n$ git add -A\n{b}\n\n$ git commit\n{c}")
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(egui::RichText::new("…or create it on GitHub").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Repo name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut git.gh_repo_name)
+                        .desired_width(200.0)
+                        .hint_text("my-game"),
+                );
+                ui.selectable_value(&mut git.gh_private, false, "Public");
+                ui.selectable_value(&mut git.gh_private, true, "Private");
+            });
+            let can_gh = !busy && !git.gh_repo_name.trim().is_empty();
+            if ui
+                .add_enabled(can_gh, egui::Button::new("Create on GitHub & push"))
+                .clicked()
+            {
+                github_publish(git, project);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Needs the GitHub CLI (gh) signed in. If it isn't, open the Terminal tab \
+                     and run:  gh auth login",
+                )
+                .small()
+                .italics()
+                .weak(),
+            );
+        }
+        ui.add_space(6.0);
+    });
+
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&git.output).monospace())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
+    });
+}
+
 /// Which Settings category/submenu is showing.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
@@ -1461,6 +1691,70 @@ fn barbarian_light() -> egui::Visuals {
     v
 }
 
+/// Short display label for a dock tab (used by the Focus-mode minimized list).
+fn dock_tab_label(tab: &DockTab) -> String {
+    match tab {
+        DockTab::Scene => "3D Scene".to_string(),
+        DockTab::Logic => "Logic".to_string(),
+        DockTab::Explorer => "Explorer".to_string(),
+        DockTab::AiChat => "AI Chat".to_string(),
+        DockTab::Log => "Log".to_string(),
+        DockTab::Terminal => "Terminal".to_string(),
+        DockTab::Git => "Git".to_string(),
+        DockTab::File(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string()),
+    }
+}
+
+/// Draw an eyeball (almond sclera + iris + pupil) centered at `c`. Muted by
+/// default so it doesn't overpower the tab title; brighter on hover; gold when
+/// Focus is active.
+fn draw_eye(painter: &egui::Painter, c: egui::Pos2, active: bool, hovered: bool) {
+    let (rx, ry) = (6.6, 4.1);
+    let n = 26;
+    let pts: Vec<egui::Pos2> = (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            egui::pos2(c.x + rx * a.cos(), c.y + ry * a.sin())
+        })
+        .collect();
+    let (sclera, iris, outline, highlight) = if active {
+        (
+            egui::Color32::from_rgb(74, 64, 34),
+            ACCENT_GOLD,
+            egui::Color32::from_rgb(120, 100, 40),
+            true,
+        )
+    } else if hovered {
+        (
+            egui::Color32::from_rgb(205, 207, 214),
+            egui::Color32::from_rgb(90, 150, 235),
+            egui::Color32::from_gray(40),
+            true,
+        )
+    } else {
+        // Dim/muted so the eye reads as a subtle icon, not a bright eyeball.
+        (
+            egui::Color32::from_rgb(72, 76, 86),
+            egui::Color32::from_rgb(104, 116, 138),
+            egui::Color32::from_gray(58),
+            false,
+        )
+    };
+    painter.add(egui::Shape::convex_polygon(
+        pts,
+        sclera,
+        egui::Stroke::new(1.0, outline),
+    ));
+    painter.circle_filled(c, 2.9, iris);
+    painter.circle_filled(c, 1.4, egui::Color32::from_rgb(16, 16, 20));
+    if highlight {
+        painter.circle_filled(c + egui::vec2(-1.0, -1.0), 0.6, egui::Color32::from_white_alpha(210));
+    }
+}
+
 /// Per-tab content router for the dockable workspace.
 struct EngineTabs<'a> {
     chat: &'a mut ChatUi,
@@ -1481,38 +1775,41 @@ struct EngineTabs<'a> {
     terminal: &'a mut TerminalState,
     /// The shell executable to launch for the terminal.
     terminal_shell: String,
+    /// Git panel state.
+    git: &'a mut GitUi,
+    /// Set to a tab when its eye (Focus toggle) is clicked; handled after the pass.
+    focus_req: &'a mut Option<DockTab>,
+    /// Set to a tab when its custom close X is clicked; handled after the pass.
+    close_req: &'a mut Option<DockTab>,
+    /// Whether Focus mode is currently active (colors the eye, flips its action).
+    in_focus: bool,
 }
 
 impl TabViewer for EngineTabs<'_> {
     type Tab = DockTab;
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        match tab {
-            DockTab::Scene => "3D Scene".into(),
-            DockTab::Logic => "Logic".into(),
-            DockTab::Explorer => "Explorer".into(),
-            DockTab::AiChat => "AI Chat".into(),
-            DockTab::Log => "Log".into(),
-            DockTab::Terminal => "Terminal".into(),
-            DockTab::File(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                // VS Code-style unsaved indicator: a dot before the name.
-                let dirty = self.file_cache.get(path).is_some_and(FileView::is_dirty);
-                if dirty {
-                    format!("● {name}").into()
-                } else {
-                    name.into()
-                }
-            }
+        // Trailing spaces reserve room for the Focus eye + close X that
+        // `on_tab_button` draws over the right end of the tab.
+        const PAD: &str = "          ";
+        let dirty = matches!(tab, DockTab::File(p) if self.file_cache.get(p).is_some_and(FileView::is_dirty));
+        let base = dock_tab_label(tab);
+        // VS Code-style unsaved indicator: a dot before the name.
+        if dirty {
+            format!("● {base}{PAD}").into()
+        } else {
+            format!("{base}{PAD}").into()
         }
     }
 
     /// The 3D Scene tab is transparent so the wgpu viewport renders through it.
     fn clear_background(&self, tab: &Self::Tab) -> bool {
         !matches!(tab, DockTab::Scene)
+    }
+
+    /// We draw our own close X (next to the Focus eye), so suppress egui_dock's.
+    fn closeable(&mut self, _tab: &mut Self::Tab) -> bool {
+        false
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
@@ -1553,30 +1850,130 @@ impl TabViewer for EngineTabs<'_> {
                     &self.terminal_shell,
                 );
             }
+            DockTab::Git => {
+                git_tab_ui(ui, self.git, self.project_root.as_deref());
+            }
             DockTab::File(path) => {
+                let lang = language_for(path);
                 let view = self
                     .file_cache
                     .entry(path.clone())
                     .or_insert_with(|| load_file_view(ui.ctx(), path.as_path()));
-                file_view_ui(ui, view);
+                file_view_ui(ui, view, lang);
+            }
+        }
+    }
+
+    /// Stable per-tab id (independent of the title, which changes with the dirty
+    /// dot), so egui_dock keeps tab identity when the title text changes.
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(("dock_tab", format!("{tab:?}")))
+    }
+
+    /// Draw the Focus eye + close X on the tab itself, right of the title (the
+    /// title reserves trailing space for them). `response` gives the tab's rect.
+    fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
+        let ctx = response.ctx.clone();
+        let rect = response.rect;
+        let slot = 15.0;
+        let pad = 4.0; // gap from the tab's right edge
+        let gap = 2.0; // gap between the eye and the X
+        let cy = rect.center().y - slot / 2.0;
+        let close_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - slot - pad, cy),
+            egui::vec2(slot, slot),
+        );
+        let eye_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 2.0 * slot - pad - gap, cy),
+            egui::vec2(slot, slot),
+        );
+
+        let pointer = ctx.input(|i| i.pointer.interact_pos());
+        let clicked = ctx.input(|i| i.pointer.primary_clicked());
+        let eye_hov = pointer.is_some_and(|p| eye_rect.contains(p));
+        let close_hov = pointer.is_some_and(|p| close_rect.contains(p));
+
+        let painter = ctx.layer_painter(response.layer_id);
+        if eye_hov || self.in_focus {
+            painter.rect_filled(eye_rect, 3.0, egui::Color32::from_black_alpha(110));
+        }
+        draw_eye(&painter, eye_rect.center(), self.in_focus, eye_hov);
+        if close_hov {
+            painter.rect_filled(close_rect, 3.0, egui::Color32::from_black_alpha(110));
+        }
+        let m = close_rect.shrink(slot * 0.32);
+        let xcol = if close_hov {
+            egui::Color32::from_rgb(228, 128, 118)
+        } else {
+            egui::Color32::from_gray(135) // ~25% dimmer than a normal ~gray-180 icon
+        };
+        let s = egui::Stroke::new(1.5, xcol);
+        painter.line_segment([m.left_top(), m.right_bottom()], s);
+        painter.line_segment([m.right_top(), m.left_bottom()], s);
+
+        if clicked {
+            if let Some(p) = pointer {
+                if eye_rect.contains(p) {
+                    *self.focus_req = Some(tab.clone());
+                } else if close_rect.contains(p) {
+                    *self.close_req = Some(tab.clone());
+                }
             }
         }
     }
 }
 
-/// Render a loaded file: code/text in a read-only code editor, an image scaled
-/// to fit, or a placeholder for binary/error.
-fn file_view_ui(ui: &mut egui::Ui, view: &mut FileView) {
+/// Map a file path to a syntax-highlighting language token (egui_extras).
+fn language_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("rs") => "rs",
+        Some("toml") => "toml",
+        Some("json") => "json",
+        Some("md" | "markdown") => "md",
+        Some("py") => "py",
+        Some("js" | "mjs") => "js",
+        Some("ts") => "ts",
+        Some("html" | "htm") => "html",
+        Some("css") => "css",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "cxx" | "hpp") => "cpp",
+        Some("sh" | "bash") => "sh",
+        Some("yaml" | "yml") => "yaml",
+        _ => "txt",
+    }
+}
+
+/// Render a loaded file: editable, syntax-highlighted code/text; an image scaled
+/// to fit; or a placeholder for binary/error.
+fn file_view_ui(ui: &mut egui::Ui, view: &mut FileView, lang: &str) {
     match view {
         FileView::Text { buf, dirty } => {
+            let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
+            let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                let mut job = egui_extras::syntax_highlighting::highlight(
+                    ui.ctx(),
+                    ui.style(),
+                    &theme,
+                    text,
+                    lang,
+                );
+                job.wrap.max_width = wrap_width;
+                ui.fonts(|f| f.layout_job(job))
+            };
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // Editable code/text; mark dirty on edit (saved via the toolbar).
+                    // Editable, highlighted code/text; mark dirty on edit (saved via the toolbar).
                     let resp = ui.add(
                         egui::TextEdit::multiline(buf)
                             .code_editor()
-                            .desired_width(f32::INFINITY),
+                            .desired_width(f32::INFINITY)
+                            .layouter(&mut layouter),
                     );
                     if resp.changed() {
                         *dirty = true;
@@ -1666,7 +2063,9 @@ fn build_ui(
     project_path: Option<&Path>,
     file_cache: &mut HashMap<PathBuf, FileView>,
     terminal: &mut TerminalState,
+    git: &mut GitUi,
     pending_command: &mut Option<PendingCommand>,
+    focus_restore: &mut Option<DockState<DockTab>>,
     dock_state: &mut DockState<DockTab>,
     scene_rect_out: &mut Option<egui::Rect>,
 ) {
@@ -1790,14 +2189,43 @@ fn build_ui(
                 (DockTab::AiChat, "AI Chat"),
                 (DockTab::Log, "Log"),
                 (DockTab::Terminal, "Terminal"),
+                (DockTab::Git, "Git"),
             ];
-            if tabs.iter().any(|(t, _)| dock_state.find_tab(t).is_none()) {
+            // (Reopen buttons are hidden during Focus mode — the minimized tabs
+            // are shown by the Focus row below instead.)
+            if focus_restore.is_none()
+                && tabs.iter().any(|(t, _)| dock_state.find_tab(t).is_none())
+            {
                 ui.separator();
                 ui.label(egui::RichText::new("Open:").small());
                 for (tab, label) in tabs {
                     if dock_state.find_tab(&tab).is_none() && ui.button(label).clicked() {
                         dock_state.push_to_focused_leaf(tab);
                     }
+                }
+            }
+
+            // Focus mode: the other tabs are "minimized" up here. Click one to
+            // focus it instead; the focused tab's eye (in its corner) exits.
+            if focus_restore.is_some() {
+                ui.separator();
+                ui.label(egui::RichText::new("Focus:").small().color(ACCENT_GOLD));
+                let focused = dock_state.iter_all_tabs().next().map(|(_, t)| t.clone());
+                if let Some(f) = &focused {
+                    ui.label(egui::RichText::new(dock_tab_label(f)).small().strong());
+                }
+                let mut switch_to: Option<DockTab> = None;
+                if let Some(saved) = focus_restore.as_ref() {
+                    for (_, tab) in saved.iter_all_tabs() {
+                        if focused.as_ref() != Some(tab)
+                            && ui.small_button(dock_tab_label(tab)).clicked()
+                        {
+                            switch_to = Some(tab.clone());
+                        }
+                    }
+                }
+                if let Some(t) = switch_to {
+                    *dock_state = DockState::new(vec![t]);
                 }
             }
 
@@ -1874,6 +2302,8 @@ fn build_ui(
     // The dockable workspace fills the central area. Each tab can be dragged into a
     // column or a full-screen tab and resized; the 3D Scene tab is the live viewport.
     let mut open_file_req: Option<PathBuf> = None;
+    let mut focus_req: Option<DockTab> = None;
+    let mut close_req: Option<DockTab> = None;
     {
         let mut viewer = EngineTabs {
             chat,
@@ -1888,6 +2318,10 @@ fn build_ui(
             file_cache,
             terminal: &mut *terminal,
             terminal_shell: ui_state.shell.command().to_string(),
+            git: &mut *git,
+            focus_req: &mut focus_req,
+            close_req: &mut close_req,
+            in_focus: focus_restore.is_some(),
         };
         DockArea::new(dock_state)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -1895,6 +2329,29 @@ fn build_ui(
     }
     // The 3D Scene tab's rect this frame (None when the Scene tab isn't visible).
     let scene_rect = *scene_rect_out;
+
+    // Custom close X clicked: remove that tab from the layout.
+    if let Some(tab) = close_req {
+        if let Some(loc) = dock_state.find_tab(&tab) {
+            dock_state.remove_tab(loc);
+        }
+    }
+
+    // Focus eye toggled: enter focus (save layout, show only this tab) or, if
+    // already focused, exit (restore the saved layout).
+    if let Some(tab) = focus_req {
+        if let Some(saved) = focus_restore.take() {
+            *dock_state = saved;
+        } else {
+            *focus_restore = Some(std::mem::replace(dock_state, DockState::new(vec![tab])));
+        }
+    }
+    // Safety: if the single focused tab got closed, leave Focus mode.
+    if focus_restore.is_some() && dock_state.iter_all_tabs().next().is_none() {
+        if let Some(saved) = focus_restore.take() {
+            *dock_state = saved;
+        }
+    }
 
     // A file was clicked in the Explorer: open (or focus) a viewer tab for it,
     // docked in the same leaf as Logic (top-center) when Logic is present.
@@ -2822,8 +3279,13 @@ struct State {
     file_cache: HashMap<PathBuf, FileView>,
     /// The in-engine terminal's shell (lazily started when the tab is shown).
     terminal: TerminalState,
+    /// Git (Source Control) panel state.
+    git: GitUi,
     /// A terminal command CoE-AI proposed, awaiting the user's approve/deny.
     pending_command: Option<PendingCommand>,
+    /// Focus mode: when Some, holds the dock layout to restore on exit (the live
+    /// `dock_state` is the single focused tab filling the workspace).
+    focus_restore: Option<DockState<DockTab>>,
 }
 
 impl State {
@@ -3105,7 +3567,9 @@ impl State {
             startup_last_project,
             file_cache: HashMap::new(),
             terminal: TerminalState::Off,
+            git: GitUi::default(),
             pending_command: None,
+            focus_restore: None,
         }
     }
 
@@ -3283,7 +3747,11 @@ impl State {
             dark_mode: self.ui.dark_mode,
             controls: self.controls,
             shell: self.ui.shell,
-            dock_state: self.dock_state.clone(),
+            // In Focus mode, save the real (un-focused) layout, not the single tab.
+            dock_state: self
+                .focus_restore
+                .clone()
+                .unwrap_or_else(|| self.dock_state.clone()),
             window_size: Some((self.config.width, self.config.height)),
             window_pos: self
                 .window
@@ -3305,6 +3773,8 @@ impl State {
         self.controls = p.controls;
         self.ui.shell = p.shell;
         self.dock_state = p.dock_state;
+        // Loading a project leaves Focus mode (the manifest holds the full layout).
+        self.focus_restore = None;
         // Restart the terminal so it uses the loaded project's shell.
         self.terminal = TerminalState::Off;
 
@@ -3482,6 +3952,18 @@ impl State {
         }
         if std::mem::take(&mut self.ui.redo_requested) {
             self.history_redo();
+        }
+
+        // Collect the result of an in-flight async git operation, if it finished.
+        let mut git_done: Option<String> = None;
+        if let Some(rx) = &self.git.rx {
+            if let Ok(out) = rx.try_recv() {
+                git_done = Some(out);
+            }
+        }
+        if let Some(out) = git_done {
+            self.git.output = out;
+            self.git.rx = None;
         }
 
         // Clear the loading splash once its timer elapses. The first (startup)
@@ -3763,7 +4245,9 @@ impl State {
         let project_path = self.project_path.clone();
         let file_cache = &mut self.file_cache;
         let terminal = &mut self.terminal;
+        let git = &mut self.git;
         let pending_command = &mut self.pending_command;
+        let focus_restore = &mut self.focus_restore;
         let chat = &mut self.chat;
         let ui_state = &mut self.ui;
         let controls = &self.controls;
@@ -3787,7 +4271,9 @@ impl State {
                 project_path.as_deref(),
                 file_cache,
                 terminal,
+                git,
                 pending_command,
+                focus_restore,
                 dock_state,
                 &mut captured_scene_rect,
             )
