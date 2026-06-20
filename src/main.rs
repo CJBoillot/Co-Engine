@@ -1,16 +1,17 @@
-//! CoEngine — Milestone 1, Step 2b: "Free-fly Camera + Mode Toggle"
+//! CoEngine — Milestone 1, Step 3: "Add a Cube"
 //!
-//! Builds on Step 2a (orbit camera). New in this step:
-//!   * a **free-fly camera** (FPS-style): WASD to move, E/Q (or Space) up/down,
-//!     right-drag to look around,
-//!   * **Tab** toggles between Orbit and Fly modes (the two are kept in sync so
-//!     the view doesn't jump),
-//!   * a real **per-frame update loop** with delta-time so movement is smooth
-//!     while keys are held (the engine now renders continuously).
+//! Builds on Step 2 (orbit + free-fly cameras). New in this step:
+//!   * **solid 3D geometry** — a unit cube drawn as triangles, lit by simple
+//!     per-face shading, sitting correctly in the scene via the depth buffer,
+//!   * a **scene** — a list of cube positions you can grow,
+//!   * **press `C`** to spawn another cube (they fill a tidy grid of slots).
+//!
+//! Versioning: the SemVer version lives in Cargo.toml and is shown in the title
+//! bar (an in-viewport bottom-left watermark arrives with egui in Step 5).
 //!
 //! Controls:
-//!   Orbit mode: left-drag orbit · right-drag pan · scroll zoom · Tab -> Fly
-//!   Fly mode:   WASD move · E/Q (or Space) up/down · right-drag look · Tab -> Orbit
+//!   Orbit mode: left-drag orbit · right-drag pan · scroll zoom · C add cube · Tab -> Fly
+//!   Fly mode:   WASD move · E/Q (or Space) up/down · right-drag look · C add cube · Tab -> Orbit
 //!   Esc quits.
 
 use std::sync::Arc;
@@ -54,6 +55,7 @@ impl Vertex {
     }
 }
 
+/// The ground grid as line endpoints (drawn as a LineList).
 fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     let mut verts = Vec::new();
     let max = half as f32 * spacing;
@@ -77,6 +79,63 @@ fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     verts
 }
 
+/// Push two triangles (a quad face) with a flat color into `out`.
+fn push_quad(out: &mut Vec<Vertex>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], color: [f32; 3]) {
+    for pos in [a, b, c, a, c, d] {
+        out.push(Vertex { position: pos, color });
+    }
+}
+
+/// A unit cube (1×1×1) centered at the origin, 36 vertices (12 triangles).
+/// Each face gets a different brightness to fake shading so the form reads as 3D.
+fn unit_cube() -> Vec<Vertex> {
+    let s = 0.5;
+
+    // Face colors: a warm orange, brighter on top, darker underneath.
+    let top = [0.92, 0.64, 0.32];
+    let bottom = [0.42, 0.27, 0.13];
+    let front = [0.84, 0.55, 0.27];
+    let back = [0.64, 0.41, 0.20];
+    let right = [0.76, 0.49, 0.24];
+    let left = [0.70, 0.45, 0.22];
+
+    // 8 corners.
+    let p000 = [-s, -s, -s];
+    let p001 = [-s, -s, s];
+    let p010 = [-s, s, -s];
+    let p011 = [-s, s, s];
+    let p100 = [s, -s, -s];
+    let p101 = [s, -s, s];
+    let p110 = [s, s, -s];
+    let p111 = [s, s, s];
+
+    let mut v = Vec::with_capacity(36);
+    push_quad(&mut v, p010, p011, p111, p110, top); // +Y
+    push_quad(&mut v, p000, p100, p101, p001, bottom); // -Y
+    push_quad(&mut v, p001, p101, p111, p011, front); // +Z
+    push_quad(&mut v, p100, p000, p010, p110, back); // -Z
+    push_quad(&mut v, p101, p100, p110, p111, right); // +X
+    push_quad(&mut v, p000, p001, p011, p010, left); // -X
+    v
+}
+
+/// Build one combined vertex buffer's worth of cube geometry: the unit cube
+/// copied to each position in `positions`. (Simple and fine for small counts;
+/// later steps can switch to GPU instancing.)
+fn build_cube_vertices(positions: &[Vec3]) -> Vec<Vertex> {
+    let base = unit_cube();
+    let mut out = Vec::with_capacity(positions.len() * base.len());
+    for p in positions {
+        for v in &base {
+            out.push(Vertex {
+                position: [v.position[0] + p.x, v.position[1] + p.y, v.position[2] + p.z],
+                color: v.color,
+            });
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Cameras
 // ---------------------------------------------------------------------------
@@ -87,7 +146,6 @@ enum CameraMode {
     Fly,
 }
 
-/// Editor-style camera that orbits a focus point.
 struct OrbitCamera {
     target: Vec3,
     distance: f32,
@@ -134,7 +192,6 @@ impl OrbitCamera {
     }
 }
 
-/// First-person "free-fly" camera: a position plus a look direction (yaw/pitch).
 struct FlyCamera {
     position: Vec3,
     yaw: f32,
@@ -142,11 +199,10 @@ struct FlyCamera {
     fovy_radians: f32,
     znear: f32,
     zfar: f32,
-    speed: f32, // movement speed in world units per second
+    speed: f32,
 }
 
 impl FlyCamera {
-    /// Unit vector the camera is looking along.
     fn forward(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
@@ -159,7 +215,6 @@ impl FlyCamera {
         proj * view
     }
 
-    /// Right-drag look: rotate the view by mouse-motion pixels.
     fn look(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.004;
         self.yaw += dx * SENSITIVITY;
@@ -169,7 +224,6 @@ impl FlyCamera {
     }
 }
 
-/// Which movement keys are currently held (for the fly camera).
 #[derive(Default)]
 struct Keys {
     forward: bool,
@@ -196,12 +250,16 @@ impl CameraUniform {
 
 fn title_for(mode: CameraMode) -> &'static str {
     match mode {
-        CameraMode::Orbit => {
-            "CoEngine — Step 2b  [Orbit]   L-drag orbit · R-drag pan · scroll zoom · Tab=Fly · Esc=quit"
-        }
-        CameraMode::Fly => {
-            "CoEngine — Step 2b  [Fly]   WASD move · E/Q up/down · R-drag look · Tab=Orbit · Esc=quit"
-        }
+        CameraMode::Orbit => concat!(
+            "CoEngine v",
+            env!("CARGO_PKG_VERSION"),
+            "   [Orbit]   L-drag orbit · R-drag pan · scroll zoom · C=add cube · Tab=Fly · Esc=quit"
+        ),
+        CameraMode::Fly => concat!(
+            "CoEngine v",
+            env!("CARGO_PKG_VERSION"),
+            "   [Fly]   WASD move · E/Q up/down · R-drag look · C=add cube · Tab=Orbit · Esc=quit"
+        ),
     }
 }
 
@@ -216,26 +274,29 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
-    pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    grid_pipeline: wgpu::RenderPipeline,
+    cube_pipeline: wgpu::RenderPipeline,
     depth_view: wgpu::TextureView,
+
+    grid_buffer: wgpu::Buffer,
+    grid_vertex_count: u32,
+
+    // The scene: cube positions, plus the GPU buffer built from them.
+    cubes: Vec<Vec3>,
+    cube_buffer: Option<wgpu::Buffer>,
+    cube_vertex_count: u32,
 
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
 
-    // Two cameras; `mode` picks which one is active.
     orbit: OrbitCamera,
     fly: FlyCamera,
     mode: CameraMode,
 
-    // Input state.
     keys: Keys,
     mouse_left_down: bool,
     mouse_right_down: bool,
-
-    // Timing for smooth, frame-rate-independent movement.
     last_frame: Instant,
 }
 
@@ -272,7 +333,6 @@ impl State {
 
         let depth_view = create_depth_view(&device, &config);
 
-        // Orbit camera: starting 3/4 view of the grid.
         let orbit = OrbitCamera {
             target: Vec3::ZERO,
             distance: 14.0,
@@ -282,8 +342,6 @@ impl State {
             znear: 0.1,
             zfar: 100.0,
         };
-
-        // Fly camera placeholder; the first Tab toggle syncs it to the orbit view.
         let fly = FlyCamera {
             position: Vec3::new(8.0, 6.0, 8.0),
             yaw: 0.0,
@@ -293,7 +351,6 @@ impl State {
             zfar: 100.0,
             speed: 8.0,
         };
-
         let mode = CameraMode::Orbit;
 
         let aspect = config.width.max(1) as f32 / config.height.max(1) as f32;
@@ -331,17 +388,32 @@ impl State {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Grid Shader"),
+            label: Some("Grid/Cube Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("grid.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Grid Pipeline Layout"),
+            label: Some("Pipeline Layout"),
             bind_group_layouts: &[&camera_bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        // Shared bits for both pipelines (same shader, same camera, same depth).
+        let depth_stencil = wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
+        let color_target = wgpu::ColorTargetState {
+            format: config.format,
+            blend: Some(wgpu::BlendState::REPLACE),
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+
+        // Grid pipeline: draws lines.
+        let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Grid Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -353,11 +425,7 @@ impl State {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[Some(color_target.clone())],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -369,21 +437,46 @@ impl State {
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Cube pipeline: draws filled triangles.
+        let cube_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Cube Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(color_target)],
+                compilation_options: Default::default(),
             }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // draw all faces (winding-agnostic; depth sorts them)
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(depth_stencil),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
         });
 
         let grid = build_grid(10, 1.0);
-        let vertex_count = grid.len() as u32;
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let grid_vertex_count = grid.len() as u32;
+        let grid_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Grid Vertex Buffer"),
             contents: bytemuck::cast_slice(&grid),
             usage: wgpu::BufferUsages::VERTEX,
@@ -395,10 +488,14 @@ impl State {
             device,
             queue,
             config,
-            pipeline,
-            vertex_buffer,
-            vertex_count,
+            grid_pipeline,
+            cube_pipeline,
             depth_view,
+            grid_buffer,
+            grid_vertex_count,
+            cubes: Vec::new(),
+            cube_buffer: None,
+            cube_vertex_count: 0,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -416,7 +513,6 @@ impl State {
         self.config.width.max(1) as f32 / self.config.height.max(1) as f32
     }
 
-    /// View*projection matrix for whichever camera is active.
     fn current_view_proj(&self) -> Mat4 {
         match self.mode {
             CameraMode::Orbit => self.orbit.view_proj(self.aspect()),
@@ -424,7 +520,6 @@ impl State {
         }
     }
 
-    /// Recompute and upload the active camera matrix.
     fn update_camera(&mut self) {
         self.camera_uniform.view_proj = self.current_view_proj().to_cols_array_2d();
         self.queue.write_buffer(
@@ -434,12 +529,40 @@ impl State {
         );
     }
 
-    /// Switch between Orbit and Fly, syncing position + look so the view is
-    /// continuous across the toggle.
+    /// Add a cube to the scene at the next free slot in a tidy grid layout, then
+    /// rebuild the cube vertex buffer.
+    fn add_cube(&mut self) {
+        let n = self.cubes.len();
+        let cols = 7;
+        let col = (n % cols) as f32 - 3.0;
+        let row = (n / cols) as f32 - 3.0;
+        // Centered on the grid; y = 0.5 so the unit cube rests on the ground.
+        self.cubes.push(Vec3::new(col * 1.5, 0.5, row * 1.5));
+        self.rebuild_cubes();
+        println!("Cubes in scene: {}", self.cubes.len());
+    }
+
+    /// Rebuild the GPU buffer holding all cubes' geometry.
+    fn rebuild_cubes(&mut self) {
+        if self.cubes.is_empty() {
+            self.cube_buffer = None;
+            self.cube_vertex_count = 0;
+            return;
+        }
+        let verts = build_cube_vertices(&self.cubes);
+        self.cube_vertex_count = verts.len() as u32;
+        self.cube_buffer = Some(self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Cube Vertex Buffer"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
     fn toggle_mode(&mut self) {
         match self.mode {
             CameraMode::Orbit => {
-                // Stand at the orbit eye, looking toward the orbit target.
                 let eye = self.orbit.eye();
                 let dir = (self.orbit.target - eye).normalize_or_zero();
                 self.fly.position = eye;
@@ -448,10 +571,9 @@ impl State {
                 self.mode = CameraMode::Fly;
             }
             CameraMode::Fly => {
-                // Orbit around a point in front of the fly camera, same distance.
                 let f = self.fly.forward();
                 self.orbit.target = self.fly.position + f * self.orbit.distance;
-                let d = -f; // direction from target back to the eye
+                let d = -f;
                 self.orbit.pitch = d.y.clamp(-1.0, 1.0).asin();
                 self.orbit.yaw = d.x.atan2(d.z);
                 self.mode = CameraMode::Orbit;
@@ -461,7 +583,6 @@ impl State {
         self.update_camera();
     }
 
-    /// Per-frame update: advance time and move the fly camera by held keys.
     fn update(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -560,10 +681,19 @@ impl State {
                 occlusion_query_set: None,
             });
 
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.draw(0..self.vertex_count, 0..1);
+
+            // Grid (lines).
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
+            pass.draw(0..self.grid_vertex_count, 0..1);
+
+            // Cubes (triangles), if any.
+            if let Some(cube_buffer) = &self.cube_buffer {
+                pass.set_pipeline(&self.cube_pipeline);
+                pass.set_vertex_buffer(0, cube_buffer.slice(..));
+                pass.draw(0..self.cube_vertex_count, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -656,6 +786,11 @@ impl ApplicationHandler for App {
                         KeyCode::KeyD => state.keys.right = pressed,
                         KeyCode::KeyE | KeyCode::Space => state.keys.up = pressed,
                         KeyCode::KeyQ => state.keys.down = pressed,
+                        KeyCode::KeyC => {
+                            if pressed && !key_event.repeat {
+                                state.add_cube();
+                            }
+                        }
                         KeyCode::Tab => {
                             if pressed && !key_event.repeat {
                                 state.toggle_mode();
@@ -691,7 +826,6 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // Clear held keys when the window loses focus so nothing gets "stuck".
             WindowEvent::Focused(false) => state.keys = Keys::default(),
 
             _ => {}
@@ -730,8 +864,6 @@ impl ApplicationHandler for App {
         }
     }
 
-    /// With ControlFlow::Poll this runs every loop iteration; keep redrawing so
-    /// movement animates smoothly even when there are no input events.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &self.state {
             state.window.request_redraw();
@@ -741,7 +873,6 @@ impl ApplicationHandler for App {
 
 fn main() {
     let event_loop = EventLoop::new().expect("failed to create the event loop");
-    // Continuous rendering: the loop runs every frame (vsync-capped on present).
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();
     event_loop
