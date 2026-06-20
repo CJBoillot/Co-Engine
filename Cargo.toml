@@ -1,10 +1,13 @@
 [package]
 name = "coengine"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
+egui = "0.29"
+egui-wgpu = "0.29"
+egui-winit = "0.29"
 glam = "0.33.1"
 pollster = "0.3"
 wgpu = "22"

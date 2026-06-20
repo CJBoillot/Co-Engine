@@ -1,14 +1,19 @@
-//! CoEngine — Milestone 1, Step 4: "Select & Remove"
+//! CoEngine — Milestone 1, Step 5: "Chat Panel + Version Watermark"
 //!
-//! Builds on Step 3 (add cubes with C). New in this step:
-//!   * **click a cube to select it** — it highlights in yellow,
-//!   * **Delete / Backspace** removes the selected cube,
-//!   * selection uses **ray picking**: a mouse click is turned into a 3D ray and
-//!     tested against each cube's bounding box; the nearest hit wins.
+//! Builds on Step 4 (select & remove). New in this step:
+//!   * **egui** is integrated as an on-screen UI layer drawn over the 3D scene,
+//!   * a **chat panel** docked on the right: a scrolling message history plus a
+//!     text box + Send/Clear. For now it **echoes locally** (no network) — it is
+//!     wired to Claude in Step 6,
+//!   * the **bottom-left version watermark** ("CoEngine v0.0.5"), read from the
+//!     crate version.
 //!
-//! Controls:
-//!   Orbit mode: left-drag orbit · right-drag pan · scroll zoom · click select · C add · Del remove · Tab -> Fly
-//!   Fly mode:   WASD move · E/Q (or Space) up/down · right-drag look · click select · C add · Del remove · Tab -> Orbit
+//! egui captures input over its own panels, so clicking/typing in the chat does
+//! not move the camera or spawn cubes.
+//!
+//! Controls (when not interacting with the chat):
+//!   Orbit: left-drag orbit · right-drag pan · scroll zoom · click select · C add · Del remove · Tab Fly
+//!   Fly:   WASD move · E/Q up/down · right-drag look · click select · C add · Del remove · Tab Orbit
 //!   Esc quits.
 
 use std::sync::Arc;
@@ -27,9 +32,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-/// Half-size of a cube (cubes are 1×1×1). Used for picking too.
 const CUBE_HALF: f32 = 0.5;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -113,8 +117,6 @@ fn unit_cube() -> Vec<Vertex> {
     v
 }
 
-/// Build cube geometry for the whole scene. The selected cube (if any) is tinted
-/// yellow so it stands out.
 fn build_cube_vertices(positions: &[Vec3], selected: Option<usize>) -> Vec<Vertex> {
     let base = unit_cube();
     let mut out = Vec::with_capacity(positions.len() * base.len());
@@ -123,7 +125,6 @@ fn build_cube_vertices(positions: &[Vec3], selected: Option<usize>) -> Vec<Verte
         let highlight = Some(i) == selected;
         for v in &base {
             let color = if highlight {
-                // Blend the face color toward bright yellow.
                 [
                     v.color[0] * 0.4 + 1.00 * 0.6,
                     v.color[1] * 0.4 + 0.95 * 0.6,
@@ -141,12 +142,10 @@ fn build_cube_vertices(positions: &[Vec3], selected: Option<usize>) -> Vec<Verte
     out
 }
 
-/// Ray vs axis-aligned bounding box (the "slab" method). Returns the distance
-/// `t` along the ray to the first intersection, or None if it misses.
 fn ray_aabb(origin: Vec3, dir: Vec3, center: Vec3, half: f32) -> Option<f32> {
     let min = center - Vec3::splat(half);
     let max = center + Vec3::splat(half);
-    let inv = Vec3::ONE / dir; // component-wise; zero dir -> inf, handled by min/max
+    let inv = Vec3::ONE / dir;
     let t0 = (min - origin) * inv;
     let t1 = (max - origin) * inv;
     let t_enter = t0.min(t1).max_element();
@@ -156,6 +155,102 @@ fn ray_aabb(origin: Vec3, dir: Vec3, center: Vec3, half: f32) -> Option<f32> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chat (UI state)
+// ---------------------------------------------------------------------------
+
+struct ChatMessage {
+    role: String,
+    text: String,
+}
+
+#[derive(Default)]
+struct ChatUi {
+    messages: Vec<ChatMessage>,
+    input: String,
+}
+
+/// Local-echo send (Step 5). Step 6 replaces the stub reply with a real Claude call.
+fn send_message(chat: &mut ChatUi) {
+    let text = chat.input.trim().to_string();
+    chat.input.clear();
+    if text.is_empty() {
+        return;
+    }
+    chat.messages.push(ChatMessage { role: "You".to_string(), text: text.clone() });
+    chat.messages.push(ChatMessage {
+        role: "Claude (stub)".to_string(),
+        text: format!("(local echo) {text}"),
+    });
+}
+
+/// Build the egui UI for this frame: bottom-left watermark + right-side chat panel.
+fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
+    // Version watermark, anchored to the bottom-left, non-interactive.
+    egui::Area::new(egui::Id::new("version_watermark"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -8.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(format!("CoEngine v{VERSION}"))
+                    .monospace()
+                    .color(egui::Color32::from_white_alpha(150)),
+            );
+        });
+
+    // Chat panel docked on the right edge.
+    egui::SidePanel::right("chat_panel")
+        .resizable(true)
+        .default_width(320.0)
+        .show(ctx, |ui| {
+            egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                ui.heading("Chat");
+                ui.label(
+                    egui::RichText::new("Local echo — wired to Claude in Step 6")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+            });
+
+            egui::TopBottomPanel::bottom("chat_input").show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut chat.input)
+                        .hint_text("Type a message…")
+                        .desired_width(f32::INFINITY),
+                );
+                let enter_pressed =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    let send_clicked = ui.button("Send").clicked();
+                    if ui.button("Clear").clicked() {
+                        chat.messages.clear();
+                    }
+                    if send_clicked || enter_pressed {
+                        send_message(chat);
+                        resp.request_focus();
+                    }
+                });
+                ui.add_space(6.0);
+            });
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for m in &chat.messages {
+                            ui.label(egui::RichText::new(format!("{}:", m.role)).strong());
+                            ui.label(&m.text);
+                            ui.add_space(6.0);
+                        }
+                    });
+            });
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -275,12 +370,12 @@ fn title_for(mode: CameraMode) -> &'static str {
         CameraMode::Orbit => concat!(
             "CoEngine v",
             env!("CARGO_PKG_VERSION"),
-            "   [Orbit]   L-drag orbit · R-drag pan · scroll zoom · click=select · C=add · Del=remove · Tab=Fly · Esc=quit"
+            "   [Orbit]   drag orbit · R-drag pan · scroll zoom · click=select · C=add · Del=remove · Tab=Fly"
         ),
         CameraMode::Fly => concat!(
             "CoEngine v",
             env!("CARGO_PKG_VERSION"),
-            "   [Fly]   WASD move · E/Q up/down · R-drag look · click=select · C=add · Del=remove · Tab=Orbit · Esc=quit"
+            "   [Fly]   WASD · E/Q up/down · R-drag look · click=select · C=add · Del=remove · Tab=Orbit"
         ),
     }
 }
@@ -323,6 +418,12 @@ struct State {
     cursor_pos: (f32, f32),
     left_drag_dist: f32,
     last_frame: Instant,
+
+    // egui (UI layer).
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    chat: ChatUi,
 }
 
 impl State {
@@ -504,6 +605,18 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        // egui setup.
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+
         State {
             window,
             surface,
@@ -532,6 +645,10 @@ impl State {
             cursor_pos: (0.0, 0.0),
             left_drag_dist: 0.0,
             last_frame: Instant::now(),
+            egui_ctx,
+            egui_state,
+            egui_renderer,
+            chat: ChatUi::default(),
         }
     }
 
@@ -556,7 +673,6 @@ impl State {
     }
 
     fn add_cube(&mut self) {
-        // Place by a monotonic counter so removed slots don't cause overlaps.
         let n = self.spawn_count;
         let cols = 7;
         let col = (n % cols) as f32 - 3.0;
@@ -584,16 +700,13 @@ impl State {
         ));
     }
 
-    /// Turn a screen-space click into a world ray and select the nearest cube hit.
     fn pick(&mut self, cursor: (f32, f32)) {
         let w = self.config.width.max(1) as f32;
         let h = self.config.height.max(1) as f32;
 
-        // Pixel -> Normalized Device Coordinates (-1..1), with Y flipped.
         let ndc_x = (cursor.0 / w) * 2.0 - 1.0;
         let ndc_y = 1.0 - (cursor.1 / h) * 2.0;
 
-        // Unproject two points (near & far planes) back into world space.
         let inv = self.current_view_proj().inverse();
         let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
         let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
@@ -603,7 +716,6 @@ impl State {
         let origin = near;
         let dir = (far - near).normalize();
 
-        // Test every cube; keep the closest hit.
         let mut best: Option<(usize, f32)> = None;
         for (i, c) in self.cubes.iter().enumerate() {
             if let Some(t) = ray_aabb(origin, dir, *c, CUBE_HALF) {
@@ -725,9 +837,10 @@ impl State {
                 label: Some("CoEngine Command Encoder"),
             });
 
+        // --- Pass 1: the 3D scene (grid + cubes) ---
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Main Pass"),
+                label: Some("Scene Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -766,7 +879,54 @@ impl State {
             }
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // --- egui: run the UI, then draw it over the scene (Pass 2) ---
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let ctx = self.egui_ctx.clone();
+        let chat = &mut self.chat;
+        let full_output = ctx.run(raw_input, |c| build_chat_ui(c, chat));
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        let user_cmd_bufs =
+            self.egui_renderer
+                .update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen);
+
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // keep the scene underneath
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // egui-wgpu wants a 'static render pass.
+            let mut pass = pass.forget_lifetime();
+            self.egui_renderer.render(&mut pass, &paint_jobs, &screen);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        self.queue
+            .submit(user_cmd_bufs.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
     }
 }
@@ -834,16 +994,47 @@ impl ApplicationHandler for App {
             return;
         };
 
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-
-            WindowEvent::Resized(new_size) => state.resize(new_size),
-
+        // Window-management events: always handled.
+        match &event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+                return;
+            }
+            WindowEvent::Resized(new_size) => {
+                state.resize(*new_size);
+                return;
+            }
             WindowEvent::RedrawRequested => {
                 state.update();
                 state.render();
+                return;
             }
+            _ => {}
+        }
 
+        // Tab toggles the camera mode. Handle it ourselves and swallow it so egui
+        // does NOT use Tab to move keyboard focus into the chat box (which would
+        // make WASD type into the chat instead of flying the camera).
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            if ke.physical_key == PhysicalKey::Code(KeyCode::Tab) {
+                if ke.state == ElementState::Pressed && !ke.repeat {
+                    state.toggle_mode();
+                }
+                return;
+            }
+        }
+
+        // Let egui consume input over its panels (typing, clicking Send, etc.).
+        let egui_consumed = state
+            .egui_state
+            .on_window_event(&state.window, &event)
+            .consumed;
+        if egui_consumed {
+            return;
+        }
+
+        // Input that drives the 3D viewport.
+        match event {
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor_pos = (position.x as f32, position.y as f32);
             }
@@ -865,7 +1056,7 @@ impl ApplicationHandler for App {
                         KeyCode::Delete | KeyCode::Backspace if first_press => {
                             state.remove_selected()
                         }
-                        KeyCode::Tab if first_press => state.toggle_mode(),
+                        // Tab is handled earlier (before egui) — see window_event top.
                         KeyCode::Escape => event_loop.exit(),
                         _ => {}
                     }
@@ -882,14 +1073,10 @@ impl ApplicationHandler for App {
                     MouseButton::Left => {
                         state.mouse_left_down = pressed;
                         if pressed {
-                            // Begin a potential click; reset drag tracking.
                             state.left_drag_dist = 0.0;
-                        } else {
-                            // Release: a small total movement counts as a click -> pick.
-                            if state.left_drag_dist < 5.0 {
-                                let cursor = state.cursor_pos;
-                                state.pick(cursor);
-                            }
+                        } else if state.left_drag_dist < 5.0 {
+                            let cursor = state.cursor_pos;
+                            state.pick(cursor);
                         }
                     }
                     MouseButton::Right => state.mouse_right_down = pressed,
@@ -927,7 +1114,6 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             let (dx, dy) = (dx as f32, dy as f32);
 
-            // Track how far the left button has dragged (to tell clicks from drags).
             if state.mouse_left_down {
                 state.left_drag_dist += dx.abs() + dy.abs();
             }
