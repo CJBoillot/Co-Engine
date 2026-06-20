@@ -34,10 +34,11 @@ use winit::window::{Window, WindowId};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const CUBE_HALF: f32 = 0.5;
+const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.8";
+const CO_VERSION: &str = "0.0.9";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -94,6 +95,53 @@ impl Vertex {
     }
 }
 
+/// A cube in the scene: a position plus a base color (shaded per-face at build).
+#[derive(Clone, Copy)]
+struct Cube {
+    pos: Vec3,
+    color: [f32; 3],
+}
+
+/// Half-grid placement: the Nth cube's (x, z) on the ground grid.
+fn grid_slot(n: usize) -> (f32, f32) {
+    let cols = 7;
+    let col = (n % cols) as f32 - 3.0;
+    let row = (n / cols) as f32 - 3.0;
+    (col * 1.5, row * 1.5)
+}
+
+/// Parse a color name or "#rrggbb" hex into RGB. Falls back to the default cube color.
+fn parse_color(name: &str) -> [f32; 3] {
+    let n = name.trim().to_lowercase();
+    if let Some(hex) = n.strip_prefix('#') {
+        if hex.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                return [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+            }
+        }
+    }
+    match n.as_str() {
+        "red" => [0.85, 0.20, 0.20],
+        "green" => [0.20, 0.70, 0.25],
+        "blue" => [0.25, 0.45, 0.95],
+        "cobalt" => [0.22, 0.45, 0.82],
+        "yellow" => [0.92, 0.85, 0.25],
+        "orange" => [0.90, 0.55, 0.20],
+        "purple" | "violet" => [0.55, 0.30, 0.75],
+        "magenta" | "pink" => [0.90, 0.35, 0.65],
+        "cyan" | "teal" => [0.25, 0.80, 0.85],
+        "white" => [0.92, 0.92, 0.92],
+        "black" => [0.10, 0.10, 0.10],
+        "gray" | "grey" => [0.50, 0.50, 0.50],
+        "brown" => [0.50, 0.33, 0.18],
+        _ => CUBE_BASE_COLOR,
+    }
+}
+
 fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     let mut verts = Vec::new();
     let max = half as f32 * spacing;
@@ -126,12 +174,13 @@ fn push_quad(out: &mut Vec<Vertex>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f
 fn unit_cube() -> Vec<Vertex> {
     let s = CUBE_HALF;
 
-    let top = [0.92, 0.64, 0.32];
-    let bottom = [0.42, 0.27, 0.13];
-    let front = [0.84, 0.55, 0.27];
-    let back = [0.64, 0.41, 0.20];
-    let right = [0.76, 0.49, 0.24];
-    let left = [0.70, 0.45, 0.22];
+    // Per-face brightness (grayscale); multiplied by each cube's color at build time.
+    let top = [1.00, 1.00, 1.00];
+    let bottom = [0.48, 0.48, 0.48];
+    let front = [0.86, 0.86, 0.86];
+    let back = [0.64, 0.64, 0.64];
+    let right = [0.76, 0.76, 0.76];
+    let left = [0.70, 0.70, 0.70];
 
     let p000 = [-s, -s, -s];
     let p001 = [-s, -s, s];
@@ -152,25 +201,30 @@ fn unit_cube() -> Vec<Vertex> {
     v
 }
 
-fn build_cube_vertices(positions: &[Vec3], selected: Option<usize>) -> Vec<Vertex> {
+fn build_cube_vertices(cubes: &[Cube], selected: Option<usize>) -> Vec<Vertex> {
     let base = unit_cube();
-    let mut out = Vec::with_capacity(positions.len() * base.len());
+    let mut out = Vec::with_capacity(cubes.len() * base.len());
 
-    for (i, p) in positions.iter().enumerate() {
+    for (i, cube) in cubes.iter().enumerate() {
         let highlight = Some(i) == selected;
         for v in &base {
+            let shade = v.color[0]; // per-face grayscale brightness
             let color = if highlight {
-                // Selected objects glow cobalt (the engine identity color).
-                [
-                    v.color[0] * 0.35 + 0.25 * 0.65,
-                    v.color[1] * 0.35 + 0.50 * 0.65,
-                    v.color[2] * 0.35 + 1.00 * 0.65,
-                ]
+                // Selected cubes glow cobalt (the engine identity color).
+                [shade * 0.25, shade * 0.55, shade * 1.00]
             } else {
-                v.color
+                [
+                    shade * cube.color[0],
+                    shade * cube.color[1],
+                    shade * cube.color[2],
+                ]
             };
             out.push(Vertex {
-                position: [v.position[0] + p.x, v.position[1] + p.y, v.position[2] + p.z],
+                position: [
+                    v.position[0] + cube.pos.x,
+                    v.position[1] + cube.pos.y,
+                    v.position[2] + cube.pos.z,
+                ],
                 color,
             });
         }
@@ -207,7 +261,7 @@ impl Role {
     fn label(self) -> &'static str {
         match self {
             Role::User => "You",
-            Role::Assistant => "Claude",
+            Role::Assistant => "CoE-AI",
         }
     }
     fn api(self) -> &'static str {
@@ -226,8 +280,36 @@ struct ChatMessage {
 /// Messages sent from the streaming worker thread back to the UI.
 enum StreamMsg {
     Delta(String),
+    Command(SceneCommand),
+    ClaudePrompt(String),
     Done,
     Error(String),
+}
+
+/// A mutation the AI agent wants applied to the scene (executed on the main thread).
+enum SceneCommand {
+    Add { x: f32, z: f32, color: [f32; 3] },
+    SetColor { index: usize, color: [f32; 3] },
+    Remove { index: usize },
+    Select { index: usize },
+    Clear,
+}
+
+/// Snapshot of the scene handed to the agent so it knows what exists.
+struct SceneSnapshot {
+    cubes: Vec<(Vec3, [f32; 3])>,
+    selected: Option<usize>,
+}
+
+/// Everything the worker thread needs to run an agent turn.
+struct AgentRequest {
+    api_key: String,
+    model_id: String,
+    effort: Option<&'static str>,
+    system: String,
+    positions: Vec<(f32, f32)>,
+    selected: Option<usize>,
+    messages: Vec<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -243,6 +325,8 @@ struct ChatUi {
     /// Currently selected model + speed (indices into MODELS / EFFORTS).
     model_idx: usize,
     effort_idx: usize,
+    /// A prompt CoE-AI prepared for the user to paste to Claude (Desktop).
+    pending_claude_prompt: Option<String>,
 }
 
 /// Find the Anthropic API key: the ANTHROPIC_API_KEY environment variable first,
@@ -275,7 +359,7 @@ fn load_api_key() -> Option<String> {
 
 /// Send the current input to Claude (real, streaming). Ignored if a reply is
 /// already in flight or the input is empty.
-fn send_message(chat: &mut ChatUi) {
+fn send_message(chat: &mut ChatUi, scene: &SceneSnapshot) {
     if chat.rx.is_some() {
         return; // a reply is already streaming
     }
@@ -306,117 +390,344 @@ fn send_message(chat: &mut ChatUi) {
     // Resolve the chosen model + speed.
     let model = &MODELS[chat.model_idx.min(MODELS.len() - 1)];
     let model_id = model.id.to_string();
-    let model_name = model.name;
     let effort: Option<&'static str> = if model.effort {
         Some(EFFORTS[chat.effort_idx.min(EFFORTS.len() - 1)].1)
     } else {
         None
     };
 
-    // Build the API conversation from everything so far.
+    // Snapshot the conversation (the user's message was already pushed above).
     let api_messages: Vec<serde_json::Value> = chat
         .messages
         .iter()
         .map(|m| serde_json::json!({ "role": m.role.api(), "content": m.text }))
         .collect();
 
-    // Create the empty assistant message the stream will fill in.
+    // Create the empty assistant message the agent's final text fills in.
     chat.messages.push(ChatMessage { role: Role::Assistant, text: String::new() });
     chat.streaming_index = Some(chat.messages.len() - 1);
-    chat.status = format!("{model_name} is replying…");
+    chat.status = "CoE-AI is working…".to_string();
 
-    // Do the blocking, streaming HTTP request off the UI thread.
+    let req = AgentRequest {
+        api_key,
+        model_id,
+        effort,
+        system: build_system_prompt(scene),
+        positions: scene.cubes.iter().map(|(p, _)| (p.x, p.z)).collect(),
+        selected: scene.selected,
+        messages: api_messages,
+    };
+
     let (tx, rx) = std::sync::mpsc::channel();
     chat.rx = Some(rx);
-    std::thread::spawn(move || stream_claude(api_key, model_id, effort, api_messages, tx));
+    std::thread::spawn(move || run_agent(req, tx));
+}
+
+/// Build the agent's system prompt from the current scene state.
+fn build_system_prompt(scene: &SceneSnapshot) -> String {
+    let mut s = String::from(
+        "You are CoE-AI, the assistant built into CoEngine, a 3D engine the user is building. \
+You can DIRECTLY change the 3D scene using the provided tools — when the user asks for a scene change \
+(add, recolor, remove, or select cubes), DO IT with the tools rather than describing code. After acting, \
+confirm in one short sentence.\n\n",
+    );
+    s.push_str(
+        "About CoEngine (use this context when writing prompts for Claude): it is a desktop 3D engine \
+written in Rust, using wgpu (DirectX 12) for rendering, winit for the window, and egui for the UI. The \
+scene is a list of cubes, each with a position and an RGB color (a `Vec<Cube>` in src/main.rs). Versioning \
+is \"CoSemVer\" (0.0.N). Cody builds the engine with Claude (the desktop assistant) and builds games with \
+you. Development goes one small step at a time.\n\n",
+    );
+    if scene.cubes.is_empty() {
+        s.push_str("The scene currently has no cubes.\n");
+    } else {
+        s.push_str(&format!("The scene has {} cube(s):\n", scene.cubes.len()));
+        for (i, (pos, color)) in scene.cubes.iter().enumerate() {
+            let marker = if scene.selected == Some(i) { "  [SELECTED]" } else { "" };
+            s.push_str(&format!(
+                "  #{i}: x={:.1}, z={:.1}, color=({:.2},{:.2},{:.2}){marker}\n",
+                pos.x, pos.z, color[0], color[1], color[2]
+            ));
+        }
+    }
+    match scene.selected {
+        Some(i) => s.push_str(&format!(
+            "\n\"This cube\" / \"the selected cube\" refers to cube #{i}.\n"
+        )),
+        None => s.push_str(
+            "\nNo cube is selected; if the user says \"this cube\" with nothing selected, ask which index.\n",
+        ),
+    }
+    s.push_str(
+        "Colors may be names (red, green, blue, orange, yellow, purple, cyan, pink, white, black, gray, brown) or hex like #33cc44.\n",
+    );
+    s.push_str(
+        "\nIMPORTANT — your limits: you can ONLY use the tools provided (currently: add/recolor/remove/select/clear cubes). You CANNOT modify CoEngine itself, save or load projects, import arbitrary assets, or do file operations. If the user asks for anything beyond your tools, do NOT pretend and do NOT give code to paste elsewhere — call the request_engine_change tool. Make the prompt SELF-CONTAINED and CoEngine-specific: include the engine context above (Rust + wgpu + egui; the `Vec<Cube>` scene of position+color), the exact capability needed, sensible defaults (e.g. a file format like JSON, and where it integrates — a CoE-AI tool and/or an Esc-menu item), and mention any load/round-trip needs. Respect CoEngine's one-step-at-a-time style. Then tell the user in one sentence that you've prepared a prompt they can copy.\n",
+    );
+    s
 }
 
 /// Worker thread: POST to the Anthropic Messages API and stream the reply,
 /// forwarding text deltas to the UI over `tx`.
-fn stream_claude(
-    api_key: String,
-    model_id: String,
-    effort: Option<&'static str>,
-    messages: Vec<serde_json::Value>,
-    tx: Sender<StreamMsg>,
-) {
-    let mut body = serde_json::json!({
-        "model": model_id,
-        "max_tokens": 1024,
-        "stream": true,
-        "messages": messages,
-    });
-    // Effort-capable models get the speed control + adaptive thinking, so a
-    // higher "Speed" setting genuinely makes Claude think harder.
-    if let Some(eff) = effort {
-        body["output_config"] = serde_json::json!({ "effort": eff });
-        body["thinking"] = serde_json::json!({ "type": "adaptive" });
-    }
-    let body_str = serde_json::to_string(&body).unwrap_or_default();
-
-    let response = ureq::post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", &api_key)
-        .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
-        .send_string(&body_str);
-
-    let response = match response {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let detail = r.into_string().unwrap_or_default();
-            let _ = tx.send(StreamMsg::Error(format!("HTTP {code}: {detail}")));
-            return;
-        }
-        Err(e) => {
-            let _ = tx.send(StreamMsg::Error(format!("request failed: {e}")));
-            return;
-        }
-    };
-
-    // The response is Server-Sent Events: lines like `data: {json}`.
-    use std::io::BufRead;
-    let reader = std::io::BufReader::new(response.into_reader());
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-            continue;
-        };
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("content_block_delta") => {
-                if let Some(t) = v
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    let _ = tx.send(StreamMsg::Delta(t.to_string()));
+/// The tools the agent can call to act on the 3D scene.
+fn tools_json() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": "add_cube",
+            "description": "Add a cube to the 3D scene. Optionally give a color (a name like \"green\" or hex like \"#33cc44\") and an x/z position on the ground; if x/z are omitted the engine auto-places it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "color": { "type": "string" },
+                    "x": { "type": "number" },
+                    "z": { "type": "number" }
                 }
             }
-            Some("message_stop") => {
-                let _ = tx.send(StreamMsg::Done);
-                return;
+        },
+        {
+            "name": "set_cube_color",
+            "description": "Change the color of an existing cube, identified by its index.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "index": { "type": "integer" },
+                    "color": { "type": "string" }
+                },
+                "required": ["index", "color"]
             }
-            Some("error") => {
-                let msg = v
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                let _ = tx.send(StreamMsg::Error(msg.to_string()));
-                return;
+        },
+        {
+            "name": "remove_cube",
+            "description": "Remove a cube from the scene by its index.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "index": { "type": "integer" } },
+                "required": ["index"]
             }
-            _ => {}
+        },
+        {
+            "name": "select_cube",
+            "description": "Select (highlight) a cube by its index.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "index": { "type": "integer" } },
+                "required": ["index"]
+            }
+        },
+        {
+            "name": "clear_scene",
+            "description": "Remove every cube from the scene.",
+            "input_schema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "request_engine_change",
+            "description": "Use this when the user asks for something you CANNOT do with your other tools (saving/loading projects, importing assets, file operations, new engine features or new tools). Provide a clear, specific prompt the user can paste to Claude (the desktop assistant that builds CoEngine) to add the capability. Do NOT give code to run elsewhere — call this tool instead.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "A ready-to-paste prompt for Claude (Desktop) describing the engine change needed." },
+                    "reason": { "type": "string", "description": "One short sentence on what the user wanted." }
+                },
+                "required": ["prompt"]
+            }
         }
+    ])
+}
+
+/// Execute one tool call against the worker's scene mirror, emit the matching
+/// SceneCommand for the main thread, and return a short result for the model.
+fn execute_tool(
+    name: &str,
+    input: &serde_json::Value,
+    mirror: &mut Vec<(f32, f32)>,
+    selected: &mut Option<usize>,
+    tx: &Sender<StreamMsg>,
+) -> String {
+    match name {
+        "add_cube" => {
+            let color_name = input.get("color").and_then(|c| c.as_str()).unwrap_or("orange");
+            let color = parse_color(color_name);
+            let n = mirror.len();
+            let (x, z) = match (
+                input.get("x").and_then(|v| v.as_f64()),
+                input.get("z").and_then(|v| v.as_f64()),
+            ) {
+                (Some(x), Some(z)) => (x as f32, z as f32),
+                _ => grid_slot(n),
+            };
+            mirror.push((x, z));
+            let _ = tx.send(StreamMsg::Command(SceneCommand::Add { x, z, color }));
+            format!("Added a {color_name} cube as #{n} at x={x:.1}, z={z:.1}.")
+        }
+        "set_cube_color" => {
+            let idx = input.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+            let color_name = input.get("color").and_then(|c| c.as_str()).unwrap_or("orange");
+            if idx < mirror.len() {
+                let color = parse_color(color_name);
+                let _ = tx.send(StreamMsg::Command(SceneCommand::SetColor { index: idx, color }));
+                format!("Cube #{idx} is now {color_name}.")
+            } else {
+                format!("There is no cube #{idx} (the scene has {} cubes).", mirror.len())
+            }
+        }
+        "remove_cube" => {
+            let idx = input.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+            if idx < mirror.len() {
+                mirror.remove(idx);
+                if *selected == Some(idx) {
+                    *selected = None;
+                }
+                let _ = tx.send(StreamMsg::Command(SceneCommand::Remove { index: idx }));
+                format!("Removed cube #{idx}.")
+            } else {
+                format!("There is no cube #{idx} (the scene has {} cubes).", mirror.len())
+            }
+        }
+        "select_cube" => {
+            let idx = input.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+            if idx < mirror.len() {
+                *selected = Some(idx);
+                let _ = tx.send(StreamMsg::Command(SceneCommand::Select { index: idx }));
+                format!("Selected cube #{idx}.")
+            } else {
+                format!("There is no cube #{idx} (the scene has {} cubes).", mirror.len())
+            }
+        }
+        "clear_scene" => {
+            mirror.clear();
+            *selected = None;
+            let _ = tx.send(StreamMsg::Command(SceneCommand::Clear));
+            "Cleared all cubes from the scene.".to_string()
+        }
+        "request_engine_change" => {
+            let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if prompt.trim().is_empty() {
+                "No prompt was provided.".to_string()
+            } else {
+                let _ = tx.send(StreamMsg::ClaudePrompt(prompt));
+                "Prepared a prompt for Claude and showed Cody a Copy button. Briefly tell Cody what it's for.".to_string()
+            }
+        }
+        other => format!("Unknown tool: {other}"),
     }
+}
+
+/// Worker thread: run the agentic tool-use loop. Tool calls mutate the scene
+/// (via SceneCommands) and their results feed back until the model gives a final
+/// text answer. Non-streaming for simplicity; capped at a few iterations.
+fn run_agent(req: AgentRequest, tx: Sender<StreamMsg>) {
+    let AgentRequest {
+        api_key,
+        model_id,
+        effort,
+        system,
+        positions,
+        selected,
+        mut messages,
+    } = req;
+
+    let tools = tools_json();
+    let mut mirror = positions;
+    let mut selected = selected;
+
+    for _ in 0..8 {
+        let mut body = serde_json::json!({
+            "model": model_id,
+            "max_tokens": 1024,
+            "system": system,
+            "tools": tools,
+            "messages": messages,
+        });
+        if let Some(eff) = effort {
+            body["output_config"] = serde_json::json!({ "effort": eff });
+            body["thinking"] = serde_json::json!({ "type": "adaptive" });
+        }
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+
+        let response = ureq::post("https://api.anthropic.com/v1/messages")
+            .set("x-api-key", &api_key)
+            .set("anthropic-version", "2023-06-01")
+            .set("content-type", "application/json")
+            .send_string(&body_str);
+
+        let response = match response {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let detail = r.into_string().unwrap_or_default();
+                let _ = tx.send(StreamMsg::Error(format!("HTTP {code}: {detail}")));
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(StreamMsg::Error(format!("request failed: {e}")));
+                return;
+            }
+        };
+
+        let raw = match response.into_string() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(StreamMsg::Error(format!("read failed: {e}")));
+                return;
+            }
+        };
+        let v: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(StreamMsg::Error(format!("bad response: {e}")));
+                return;
+            }
+        };
+
+        let content = v
+            .get("content")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut text = String::new();
+        let mut tool_uses: Vec<serde_json::Value> = Vec::new();
+        for block in &content {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                Some("tool_use") => tool_uses.push(block.clone()),
+                _ => {}
+            }
+        }
+
+        if tool_uses.is_empty() {
+            if !text.trim().is_empty() {
+                let _ = tx.send(StreamMsg::Delta(text));
+            }
+            let _ = tx.send(StreamMsg::Done);
+            return;
+        }
+
+        if !text.trim().is_empty() {
+            let _ = tx.send(StreamMsg::Delta(format!("{}\n", text.trim())));
+        }
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        for tu in &tool_uses {
+            let id = tu.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let name = tu.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let input = tu.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let result = execute_tool(name, &input, &mut mirror, &mut selected, &tx);
+            results.push(serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": result,
+            }));
+        }
+
+        messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+        messages.push(serde_json::json!({ "role": "user", "content": results }));
+    }
+
+    let _ = tx.send(StreamMsg::Delta("(Stopped after several tool steps.)".to_string()));
     let _ = tx.send(StreamMsg::Done);
 }
 
@@ -600,6 +911,7 @@ fn build_ui(
     chat: &mut ChatUi,
     mode: CameraMode,
     logo: Option<&egui::TextureHandle>,
+    scene: &SceneSnapshot,
 ) {
     // Apply the selected theme + mode (UI only — the 3D background is fixed).
     ctx.set_visuals(theme_visuals(ui_state.theme, ui_state.dark_mode));
@@ -642,7 +954,7 @@ fn build_ui(
     });
 
     // Right-side chat panel.
-    build_chat_panel(ctx, chat);
+    build_chat_panel(ctx, chat, scene);
 
     // Tab content. The 3D Scene tab leaves the central area empty so the wgpu
     // viewport shows through; other tabs cover it with a placeholder.
@@ -790,7 +1102,7 @@ fn build_ui(
 }
 
 /// Build the right-side chat panel.
-fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi) {
+fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi, scene: &SceneSnapshot) {
     egui::SidePanel::right("chat_panel")
         .resizable(true)
         .default_width(320.0)
@@ -804,11 +1116,45 @@ fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi) {
                 ui.add_space(4.0);
             });
 
+            // A prompt CoE-AI prepared for the user to paste to Claude (Desktop).
+            if let Some(prompt) = chat.pending_claude_prompt.clone() {
+                egui::TopBottomPanel::top("claude_prompt_panel").show_inside(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(40, 33, 18))
+                        .stroke(egui::Stroke::new(1.0, ACCENT_GOLD))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Prompt for Claude (to evolve the engine):")
+                                    .strong()
+                                    .color(ACCENT_GOLD),
+                            );
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(120.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(&prompt).small());
+                                });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy prompt").clicked() {
+                                    ui.output_mut(|o| o.copied_text = prompt.clone());
+                                }
+                                if ui.button("Dismiss").clicked() {
+                                    chat.pending_claude_prompt = None;
+                                }
+                            });
+                        });
+                });
+            }
+
             egui::TopBottomPanel::bottom("chat_input").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 let streaming = chat.rx.is_some();
-                let resp = ui.add_enabled(
-                    !streaming,
+                // Always enabled so focus persists across sends (Send button locks instead).
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut chat.input)
                         .hint_text("Message CoE-AI…")
                         .desired_width(f32::INFINITY),
@@ -844,7 +1190,7 @@ fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi) {
                             chat.messages.clear();
                         }
                         if send_clicked || enter_pressed {
-                            send_message(chat);
+                            send_message(chat, scene);
                             resp.request_focus();
                         }
                     });
@@ -1005,11 +1351,10 @@ struct State {
     grid_buffer: wgpu::Buffer,
     grid_vertex_count: u32,
 
-    cubes: Vec<Vec3>,
+    cubes: Vec<Cube>,
     cube_buffer: Option<wgpu::Buffer>,
     cube_vertex_count: u32,
     selected: Option<usize>,
-    spawn_count: u32,
 
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -1245,7 +1590,6 @@ impl State {
             cube_buffer: None,
             cube_vertex_count: 0,
             selected: None,
-            spawn_count: 0,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -1301,14 +1645,12 @@ impl State {
     }
 
     fn add_cube(&mut self) {
-        let n = self.spawn_count;
-        let cols = 7;
-        let col = (n % cols) as f32 - 3.0;
-        let row = (n / cols) as f32 - 3.0;
-        self.cubes.push(Vec3::new(col * 1.5, CUBE_HALF, row * 1.5));
-        self.spawn_count += 1;
+        let (x, z) = grid_slot(self.cubes.len());
+        self.cubes.push(Cube {
+            pos: Vec3::new(x, CUBE_HALF, z),
+            color: CUBE_BASE_COLOR,
+        });
         self.rebuild_cubes();
-        println!("Cubes in scene: {}", self.cubes.len());
     }
 
     fn rebuild_cubes(&mut self) {
@@ -1346,7 +1688,7 @@ impl State {
 
         let mut best: Option<(usize, f32)> = None;
         for (i, c) in self.cubes.iter().enumerate() {
-            if let Some(t) = ray_aabb(origin, dir, *c, CUBE_HALF) {
+            if let Some(t) = ray_aabb(origin, dir, c.pos, CUBE_HALF) {
                 if best.map_or(true, |(_, bt)| t < bt) {
                     best = Some((i, t));
                 }
@@ -1431,14 +1773,18 @@ impl State {
             }
         }
 
-        // Drain any streamed chat tokens that arrived since last frame.
+        // Drain agent output (text + scene commands) since last frame.
         let mut deltas: Vec<String> = Vec::new();
+        let mut commands: Vec<SceneCommand> = Vec::new();
+        let mut claude_prompt: Option<String> = None;
         let mut done = false;
         let mut error: Option<String> = None;
         if let Some(rx) = &self.chat.rx {
             loop {
                 match rx.try_recv() {
                     Ok(StreamMsg::Delta(t)) => deltas.push(t),
+                    Ok(StreamMsg::Command(c)) => commands.push(c),
+                    Ok(StreamMsg::ClaudePrompt(p)) => claude_prompt = Some(p),
                     Ok(StreamMsg::Done) => {
                         done = true;
                         break;
@@ -1456,6 +1802,48 @@ impl State {
                 }
             }
         }
+
+        // Apply scene commands the agent issued.
+        if !commands.is_empty() {
+            for cmd in commands {
+                match cmd {
+                    SceneCommand::Add { x, z, color } => self.cubes.push(Cube {
+                        pos: Vec3::new(x, CUBE_HALF, z),
+                        color,
+                    }),
+                    SceneCommand::SetColor { index, color } => {
+                        if index < self.cubes.len() {
+                            self.cubes[index].color = color;
+                        }
+                    }
+                    SceneCommand::Remove { index } => {
+                        if index < self.cubes.len() {
+                            self.cubes.remove(index);
+                            self.selected = match self.selected {
+                                Some(s) if s == index => None,
+                                Some(s) if s > index => Some(s - 1),
+                                other => other,
+                            };
+                        }
+                    }
+                    SceneCommand::Select { index } => {
+                        if index < self.cubes.len() {
+                            self.selected = Some(index);
+                        }
+                    }
+                    SceneCommand::Clear => {
+                        self.cubes.clear();
+                        self.selected = None;
+                    }
+                }
+            }
+            self.rebuild_cubes();
+        }
+
+        if let Some(p) = claude_prompt {
+            self.chat.pending_claude_prompt = Some(p);
+        }
+
         if !deltas.is_empty() || done {
             if let Some(idx) = self.chat.streaming_index {
                 if let Some(msg) = self.chat.messages.get_mut(idx) {
@@ -1561,9 +1949,14 @@ impl State {
         let ctx = self.egui_ctx.clone();
         let mode = self.mode;
         let logo = self.logo_texture.as_ref();
+        let scene = SceneSnapshot {
+            cubes: self.cubes.iter().map(|c| (c.pos, c.color)).collect(),
+            selected: self.selected,
+        };
         let chat = &mut self.chat;
         let ui_state = &mut self.ui;
-        let full_output = ctx.run(raw_input, |c| build_ui(c, ui_state, chat, mode, logo));
+        let full_output =
+            ctx.run(raw_input, |c| build_ui(c, ui_state, chat, mode, logo, &scene));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
