@@ -37,7 +37,7 @@ const CUBE_HALF: f32 = 0.5;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.7";
+const CO_VERSION: &str = "0.0.8";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -65,6 +65,10 @@ const EFFORTS: &[(&str, &str)] = &[
 
 const DEFAULT_MODEL_IDX: usize = 0; // Haiku 4.5 (cheapest/fastest, default)
 const DEFAULT_EFFORT_IDX: usize = 1; // Balanced
+
+// Forged CoEngine accent colors (from the icon): cobalt identity, gold accents.
+const ACCENT_GOLD: egui::Color32 = egui::Color32::from_rgb(217, 138, 43);
+const ACCENT_COBALT: egui::Color32 = egui::Color32::from_rgb(56, 116, 210);
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -94,9 +98,9 @@ fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     let mut verts = Vec::new();
     let max = half as f32 * spacing;
 
-    let gray = [0.32, 0.32, 0.34];
-    let x_axis = [0.85, 0.25, 0.25];
-    let z_axis = [0.25, 0.45, 0.90];
+    let gray = [0.18, 0.20, 0.24]; // quieter grid
+    let x_axis = [0.90, 0.32, 0.28]; // clearer red X axis
+    let z_axis = [0.30, 0.58, 1.00]; // clearer blue Z axis
 
     for i in -half..=half {
         let p = i as f32 * spacing;
@@ -156,10 +160,11 @@ fn build_cube_vertices(positions: &[Vec3], selected: Option<usize>) -> Vec<Verte
         let highlight = Some(i) == selected;
         for v in &base {
             let color = if highlight {
+                // Selected objects glow cobalt (the engine identity color).
                 [
-                    v.color[0] * 0.4 + 1.00 * 0.6,
-                    v.color[1] * 0.4 + 0.95 * 0.6,
-                    v.color[2] * 0.4 + 0.30 * 0.6,
+                    v.color[0] * 0.35 + 0.25 * 0.65,
+                    v.color[1] * 0.35 + 0.50 * 0.65,
+                    v.color[2] * 0.35 + 1.00 * 0.65,
                 ]
             } else {
                 v.color
@@ -415,19 +420,377 @@ fn stream_claude(
     let _ = tx.send(StreamMsg::Done);
 }
 
-/// Build the egui UI for this frame: bottom-left watermark + right-side chat panel.
-fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
-    egui::Area::new(egui::Id::new("version_watermark"))
-        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -8.0))
-        .interactable(false)
-        .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(format!("CoEngine v{CO_VERSION}"))
-                    .monospace()
-                    .color(egui::Color32::from_white_alpha(150)),
-            );
-        });
+/// Visual theme preset for the UI (the 3D viewport is unaffected by themes).
+#[derive(Clone, Copy, PartialEq)]
+enum Theme {
+    DefaultSimple,
+    Barbarian,
+}
 
+/// Which main editor tab is active.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Scene,
+    Logic,
+    Code,
+}
+
+/// UI/chrome state: theme, menu/modal visibility, active tab, controls overlay.
+struct UiState {
+    theme: Theme,
+    dark_mode: bool,
+    menu_open: bool,
+    settings_open: bool,
+    show_debug: bool,
+    active_tab: Tab,
+    should_quit: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            theme: Theme::DefaultSimple,
+            dark_mode: true,
+            menu_open: false,
+            settings_open: false,
+            show_debug: true,
+            active_tab: Tab::Scene,
+            should_quit: false,
+        }
+    }
+}
+
+/// Pick the egui visuals for the chosen theme + light/dark mode.
+fn theme_visuals(theme: Theme, dark: bool) -> egui::Visuals {
+    match (theme, dark) {
+        (Theme::DefaultSimple, true) => default_dark(),
+        (Theme::DefaultSimple, false) => default_light(),
+        (Theme::Barbarian, true) => barbarian_dark(),
+        (Theme::Barbarian, false) => barbarian_light(),
+    }
+}
+
+/// "Default Simple" dark: clean charcoal-iron base, cobalt identity, gold accents.
+fn default_dark() -> egui::Visuals {
+    use egui::{Color32, Rounding, Stroke};
+    let round = Rounding::same(3.0);
+    let charcoal = Color32::from_rgb(18, 20, 26);
+    let iron = Color32::from_rgb(34, 38, 46);
+    let iron_hover = Color32::from_rgb(50, 56, 66);
+    let slate = Color32::from_rgb(24, 27, 34);
+    let text = Color32::from_rgb(226, 221, 207);
+
+    let mut v = egui::Visuals::dark();
+    v.override_text_color = Some(text);
+    v.panel_fill = charcoal;
+    v.window_fill = slate;
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(80, 64, 36));
+    v.window_rounding = Rounding::same(5.0);
+    v.extreme_bg_color = Color32::from_rgb(12, 13, 17);
+    v.faint_bg_color = Color32::from_rgb(28, 31, 38);
+    v.selection.bg_fill = Color32::from_rgb(34, 64, 120);
+    v.selection.stroke = Stroke::new(1.0, ACCENT_COBALT);
+    v.hyperlink_color = ACCENT_GOLD;
+
+    v.widgets.noninteractive.bg_fill = charcoal;
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(42, 46, 54));
+
+    v.widgets.inactive.bg_fill = iron;
+    v.widgets.inactive.weak_bg_fill = iron;
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(62, 68, 78));
+    v.widgets.inactive.rounding = round;
+
+    v.widgets.hovered.bg_fill = iron_hover;
+    v.widgets.hovered.weak_bg_fill = iron_hover;
+    v.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5, ACCENT_GOLD);
+    v.widgets.hovered.rounding = round;
+
+    v.widgets.active.bg_fill = Color32::from_rgb(38, 64, 116);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(38, 64, 116);
+    v.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT_COBALT);
+    v.widgets.active.rounding = round;
+
+    v.widgets.open.bg_fill = iron;
+    v.widgets.open.fg_stroke = Stroke::new(1.0, text);
+    v.widgets.open.rounding = round;
+    v
+}
+
+/// "Default Simple" light: cool stone/parchment.
+fn default_light() -> egui::Visuals {
+    use egui::{Color32, Rounding, Stroke};
+    let round = Rounding::same(3.0);
+    let parchment = Color32::from_rgb(224, 218, 204);
+    let stone = Color32::from_rgb(202, 196, 182);
+    let ink = Color32::from_rgb(38, 34, 28);
+
+    let mut v = egui::Visuals::light();
+    v.override_text_color = Some(ink);
+    v.panel_fill = parchment;
+    v.window_fill = Color32::from_rgb(232, 227, 214);
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(150, 120, 70));
+    v.faint_bg_color = stone;
+    v.extreme_bg_color = Color32::from_rgb(238, 233, 222);
+    v.selection.bg_fill = Color32::from_rgb(150, 178, 222);
+    v.selection.stroke = Stroke::new(1.0, ACCENT_COBALT);
+    v.hyperlink_color = Color32::from_rgb(150, 95, 25);
+    v.widgets.inactive.bg_fill = stone;
+    v.widgets.inactive.weak_bg_fill = stone;
+    v.widgets.inactive.rounding = round;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5, Color32::from_rgb(176, 110, 30));
+    v.widgets.hovered.rounding = round;
+    v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT_COBALT);
+    v.widgets.active.rounding = round;
+    v
+}
+
+/// "Barbarian" dark: heavier, warmer forged look — leather/iron tones, bold gold
+/// borders, stronger bevels. (Image-based metal/rune textures are a future layer.)
+fn barbarian_dark() -> egui::Visuals {
+    use egui::{Color32, Rounding, Stroke};
+    let r = Rounding::same(5.0);
+    let mut v = default_dark();
+    v.panel_fill = Color32::from_rgb(28, 23, 18);
+    v.window_fill = Color32::from_rgb(36, 29, 22);
+    v.window_stroke = Stroke::new(2.0, ACCENT_GOLD);
+    v.window_rounding = Rounding::same(6.0);
+    v.faint_bg_color = Color32::from_rgb(40, 33, 25);
+    v.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 23, 18);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(48, 40, 30);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(48, 40, 30);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.5, Color32::from_rgb(120, 92, 44));
+    v.widgets.inactive.rounding = r;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(64, 53, 38);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(64, 53, 38);
+    v.widgets.hovered.bg_stroke = Stroke::new(2.0, ACCENT_GOLD);
+    v.widgets.hovered.rounding = r;
+    v.widgets.active.bg_fill = Color32::from_rgb(56, 78, 130);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(56, 78, 130);
+    v.widgets.active.bg_stroke = Stroke::new(2.0, ACCENT_COBALT);
+    v.widgets.active.rounding = r;
+    v.selection.bg_fill = Color32::from_rgb(48, 82, 142);
+    v
+}
+
+/// "Barbarian" light: tanned leather/parchment with heavy gold edges.
+fn barbarian_light() -> egui::Visuals {
+    use egui::{Color32, Stroke};
+    let mut v = default_light();
+    v.panel_fill = Color32::from_rgb(214, 200, 176);
+    v.window_fill = Color32::from_rgb(224, 211, 188);
+    v.window_stroke = Stroke::new(2.0, Color32::from_rgb(150, 110, 50));
+    v.faint_bg_color = Color32::from_rgb(198, 184, 160);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(198, 182, 156);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(198, 182, 156);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.5, Color32::from_rgb(150, 110, 50));
+    v.widgets.hovered.bg_stroke = Stroke::new(2.0, Color32::from_rgb(176, 110, 30));
+    v.widgets.active.bg_stroke = Stroke::new(2.0, ACCENT_COBALT);
+    v
+}
+
+/// Build the whole egui UI for this frame: top bar (menu + identity + tabs), tool
+/// row, tab content, chat panel, the bottom-left controls HUD, and menu/settings.
+fn build_ui(
+    ctx: &egui::Context,
+    ui_state: &mut UiState,
+    chat: &mut ChatUi,
+    mode: CameraMode,
+    logo: Option<&egui::TextureHandle>,
+) {
+    // Apply the selected theme + mode (UI only — the 3D background is fixed).
+    ctx.set_visuals(theme_visuals(ui_state.theme, ui_state.dark_mode));
+
+    // Top bar: Menu + identity + tabs, all on one row.
+    egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.button("Menu").clicked() {
+                ui_state.menu_open = true;
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("CoEngine").strong().color(ACCENT_GOLD));
+            ui.label(egui::RichText::new(format!("v{CO_VERSION}")));
+            ui.separator();
+            ui.selectable_value(&mut ui_state.active_tab, Tab::Scene, "3D Scene");
+            ui.selectable_value(&mut ui_state.active_tab, Tab::Logic, "Logic");
+            ui.selectable_value(&mut ui_state.active_tab, Tab::Code, "Code");
+            // When the debug overlay is hidden, offer a way back (also bound to H).
+            if !ui_state.show_debug {
+                ui.separator();
+                if ui
+                    .button("Debug Info (H)")
+                    .on_hover_text("Show the controls & version overlay (H)")
+                    .clicked()
+                {
+                    ui_state.show_debug = true;
+                }
+            }
+        });
+        ui.add_space(2.0);
+    });
+
+    // Tool row (blank placeholder for now).
+    egui::TopBottomPanel::top("tool_bar").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("Tools").small());
+        });
+    });
+
+    // Right-side chat panel.
+    build_chat_panel(ctx, chat);
+
+    // Tab content. The 3D Scene tab leaves the central area empty so the wgpu
+    // viewport shows through; other tabs cover it with a placeholder.
+    match ui_state.active_tab {
+        Tab::Scene => {}
+        Tab::Logic => {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("Logic — coming soon").heading().weak());
+                });
+            });
+        }
+        Tab::Code => {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("Code — coming soon").heading().weak());
+                });
+            });
+        }
+    }
+
+    // Bottom-left debug overlay: controls + version on a dark plate so the text is
+    // readable over the 3D viewport. Hidden entirely with H (re-shown via the top bar).
+    if ui_state.show_debug {
+        egui::Area::new(egui::Id::new("hud_bottom_left"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -10.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(12, 14, 20, 235))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 56, 30)))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        let text = egui::Color32::from_rgb(228, 223, 209);
+                        let dim = egui::Color32::from_rgb(168, 163, 148);
+                        let cam = match mode {
+                            CameraMode::Orbit => {
+                                "Orbit:  drag = orbit · R-drag = pan · scroll = zoom"
+                            }
+                            CameraMode::Fly => "Fly:  WASD move · E/Q up/down · R-drag = look",
+                        };
+                        ui.label(egui::RichText::new(cam).color(text).small());
+                        ui.label(
+                            egui::RichText::new(
+                                "click = select · C = add cube · Del = remove · Tab = orbit/fly",
+                            )
+                            .color(text)
+                            .small(),
+                        );
+                        ui.label(
+                            egui::RichText::new("Esc = menu · H = hide debug info")
+                                .color(dim)
+                                .small(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("CoEngine v{CO_VERSION}"))
+                                .monospace()
+                                .color(ACCENT_GOLD),
+                        );
+                    });
+            });
+    }
+
+    // Menu window (opened by Esc or the Menu button).
+    if ui_state.menu_open {
+        egui::Window::new("menu")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(240.0);
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    if let Some(tex) = logo {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(56.0, 56.0),
+                        )));
+                    }
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("CoEngine").heading().color(ACCENT_GOLD));
+                    ui.label(egui::RichText::new(format!("v{CO_VERSION}")).small());
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                let bw = ui.available_width();
+                if ui
+                    .add_sized([bw, 34.0], egui::Button::new("Settings"))
+                    .clicked()
+                {
+                    ui_state.settings_open = true;
+                    ui_state.menu_open = false;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized(
+                        [bw, 34.0],
+                        egui::Button::new("Exit").fill(egui::Color32::from_rgb(122, 44, 38)),
+                    )
+                    .clicked()
+                {
+                    ui_state.should_quit = true;
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if ui.add_sized([bw, 24.0], egui::Button::new("Close")).clicked() {
+                    ui_state.menu_open = false;
+                }
+                ui.add_space(8.0);
+            });
+    }
+
+    // Settings window (modal-ish).
+    if ui_state.settings_open {
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(260.0);
+                ui.label("Theme");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut ui_state.theme, Theme::DefaultSimple, "Default Simple");
+                    ui.selectable_value(&mut ui_state.theme, Theme::Barbarian, "Barbarian");
+                });
+                ui.add_space(6.0);
+                ui.label("Mode (UI only — does not affect the 3D view)");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut ui_state.dark_mode, true, "Dark");
+                    ui.selectable_value(&mut ui_state.dark_mode, false, "Light");
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    ui_state.settings_open = false;
+                }
+            });
+    }
+}
+
+/// Build the right-side chat panel.
+fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi) {
     egui::SidePanel::right("chat_panel")
         .resizable(true)
         .default_width(320.0)
@@ -435,37 +798,6 @@ fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
             egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Chat");
-
-                // Model selector (speed + cost).
-                ui.horizontal(|ui| {
-                    ui.label("Model:");
-                    egui::ComboBox::from_id_salt("model_select")
-                        .selected_text(MODELS[chat.model_idx].name)
-                        .show_ui(ui, |ui| {
-                            for (i, m) in MODELS.iter().enumerate() {
-                                ui.selectable_value(&mut chat.model_idx, i, m.name);
-                            }
-                        });
-                });
-
-                // Speed selector (the API effort level) — disabled for Haiku.
-                let effort_capable = MODELS[chat.model_idx].effort;
-                ui.horizontal(|ui| {
-                    ui.label("Speed:");
-                    ui.add_enabled_ui(effort_capable, |ui| {
-                        egui::ComboBox::from_id_salt("speed_select")
-                            .selected_text(EFFORTS[chat.effort_idx].0)
-                            .show_ui(ui, |ui| {
-                                for (i, e) in EFFORTS.iter().enumerate() {
-                                    ui.selectable_value(&mut chat.effort_idx, i, e.0);
-                                }
-                            });
-                    });
-                    if !effort_capable {
-                        ui.label(egui::RichText::new("(n/a for Haiku)").weak().small());
-                    }
-                });
-
                 if !chat.status.is_empty() {
                     ui.label(egui::RichText::new(&chat.status).small().italics());
                 }
@@ -478,20 +810,44 @@ fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
                 let resp = ui.add_enabled(
                     !streaming,
                     egui::TextEdit::singleline(&mut chat.input)
-                        .hint_text("Message Claude…")
+                        .hint_text("Message CoE-AI…")
                         .desired_width(f32::INFINITY),
                 );
                 let enter_pressed =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let send_clicked = ui.add_enabled(!streaming, egui::Button::new("Send")).clicked();
-                    if ui.button("Clear").clicked() {
-                        chat.messages.clear();
+                    // Model drop-up. Effort-capable models also show a Speed drop-up.
+                    egui::ComboBox::from_id_salt("model_select")
+                        .selected_text(MODELS[chat.model_idx].name)
+                        .show_ui(ui, |ui| {
+                            for (i, m) in MODELS.iter().enumerate() {
+                                ui.selectable_value(&mut chat.model_idx, i, m.name);
+                            }
+                        });
+                    if MODELS[chat.model_idx].effort {
+                        egui::ComboBox::from_id_salt("speed_select")
+                            .selected_text(EFFORTS[chat.effort_idx].0)
+                            .show_ui(ui, |ui| {
+                                for (i, e) in EFFORTS.iter().enumerate() {
+                                    ui.selectable_value(&mut chat.effort_idx, i, e.0);
+                                }
+                            });
                     }
-                    if send_clicked || enter_pressed {
-                        send_message(chat);
-                        resp.request_focus();
-                    }
+
+                    // Send / Clear pinned to the right of the same row.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let send_clicked =
+                            ui.add_enabled(!streaming, egui::Button::new("Send")).clicked();
+                        if ui.button("Clear").clicked() {
+                            chat.messages.clear();
+                        }
+                        if send_clicked || enter_pressed {
+                            send_message(chat);
+                            resp.request_focus();
+                        }
+                    });
                 });
                 ui.add_space(6.0);
             });
@@ -624,17 +980,11 @@ impl CameraUniform {
 }
 
 fn title_for(mode: CameraMode) -> String {
-    let (name, controls) = match mode {
-        CameraMode::Orbit => (
-            "Orbit",
-            "drag orbit · R-drag pan · scroll zoom · click=select · C=add · Del=remove · Tab=Fly",
-        ),
-        CameraMode::Fly => (
-            "Fly",
-            "WASD · E/Q up/down · R-drag look · click=select · C=add · Del=remove · Tab=Orbit",
-        ),
+    let name = match mode {
+        CameraMode::Orbit => "Orbit",
+        CameraMode::Fly => "Fly",
     };
-    format!("CoEngine v{CO_VERSION}   [{name}]   {controls}")
+    format!("CoEngine v{CO_VERSION}   [{name}]")
 }
 
 // ---------------------------------------------------------------------------
@@ -680,10 +1030,13 @@ struct State {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     chat: ChatUi,
+    ui: UiState,
+    /// The CoE logo as an egui texture (None if assets/icon.png is missing).
+    logo_texture: Option<egui::TextureHandle>,
 }
 
 impl State {
-    fn new(window: Arc<Window>) -> State {
+    fn new(window: Arc<Window>, logo: Option<(Vec<u8>, u32, u32)>) -> State {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -872,6 +1225,11 @@ impl State {
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
 
+        let logo_texture = logo.map(|(rgba, w, h)| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            egui_ctx.load_texture("coengine_logo", image, egui::TextureOptions::LINEAR)
+        });
+
         State {
             window,
             surface,
@@ -908,6 +1266,17 @@ impl State {
                 effort_idx: DEFAULT_EFFORT_IDX,
                 ..Default::default()
             },
+            ui: UiState::default(),
+            logo_texture,
+        }
+    }
+
+    /// Esc behavior: close the settings modal if open, else toggle the menu.
+    fn toggle_menu(&mut self) {
+        if self.ui.settings_open {
+            self.ui.settings_open = false;
+        } else {
+            self.ui.menu_open = !self.ui.menu_open;
         }
     }
 
@@ -1146,6 +1515,10 @@ impl State {
                 label: Some("CoEngine Command Encoder"),
             });
 
+        // Fixed cinematic 3D background — independent of the UI theme/mode so scene
+        // creation stays visually consistent.
+        let clear = wgpu::Color { r: 0.055, g: 0.070, b: 0.095, a: 1.0 };
+
         // --- Pass 1: the 3D scene ---
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1154,12 +1527,7 @@ impl State {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.10,
-                            g: 0.20,
-                            b: 0.30,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1191,8 +1559,11 @@ impl State {
         // --- egui UI over the scene ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
+        let mode = self.mode;
+        let logo = self.logo_texture.as_ref();
         let chat = &mut self.chat;
-        let full_output = ctx.run(raw_input, |c| build_chat_ui(c, chat));
+        let ui_state = &mut self.ui;
+        let full_output = ctx.run(raw_input, |c| build_ui(c, ui_state, chat, mode, logo));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -1304,7 +1675,7 @@ impl ApplicationHandler for App {
                 .expect("failed to create the window"),
         );
 
-        self.state = Some(State::new(window));
+        self.state = Some(State::new(window, logo));
 
         if let Some(state) = &self.state {
             state.window.request_redraw();
@@ -1333,6 +1704,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 state.update();
                 state.render();
+                if state.ui.should_quit {
+                    event_loop.exit();
+                }
                 return;
             }
             _ => {}
@@ -1378,7 +1752,10 @@ impl ApplicationHandler for App {
                         KeyCode::Delete | KeyCode::Backspace if first_press => {
                             state.remove_selected()
                         }
-                        KeyCode::Escape => event_loop.exit(),
+                        KeyCode::KeyH if first_press => {
+                            state.ui.show_debug = !state.ui.show_debug
+                        }
+                        KeyCode::Escape if first_press => state.toggle_menu(),
                         _ => {}
                     }
                 }
