@@ -17,10 +17,14 @@
 //!   Esc quits.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
@@ -43,7 +47,7 @@ const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.13";
+const CO_VERSION: &str = "0.0.14";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -287,8 +291,17 @@ enum StreamMsg {
     Delta(String),
     Command(SceneCommand),
     ClaudePrompt(String),
+    /// CoE-AI wants to run a terminal command; the main thread asks the user to
+    /// approve, runs it, and sends the captured output back via `reply`.
+    CommandRequest { command: String, reply: Sender<String> },
     Done,
     Error(String),
+}
+
+/// A terminal command CoE-AI proposed, awaiting the user's approve/deny.
+struct PendingCommand {
+    command: String,
+    reply: Sender<String>,
 }
 
 /// A mutation the AI agent wants applied to the scene (executed on the main thread).
@@ -434,7 +447,9 @@ fn build_system_prompt(scene: &SceneSnapshot) -> String {
         "You are CoE-AI, the assistant built into CoEngine, a 3D engine the user is building. \
 You can DIRECTLY change the 3D scene using the provided tools — when the user asks for a scene change \
 (add, recolor, remove, or select cubes), DO IT with the tools rather than describing code. After acting, \
-confirm in one short sentence.\n\n",
+confirm in one short sentence. You also have a `run_command` tool that runs a shell command in the \
+engine's terminal (the user must approve each one) and returns its output — use it for git, file listing, \
+builds, and similar tasks.\n\n",
     );
     s.push_str(
         "About CoEngine (use this context when writing prompts for Claude): it is a desktop 3D engine \
@@ -525,6 +540,17 @@ fn tools_json() -> serde_json::Value {
             "input_schema": { "type": "object", "properties": {} }
         },
         {
+            "name": "run_command",
+            "description": "Run a shell command in the engine's terminal (PowerShell/cmd, in the project folder) and get its output back. Use for git, file listing, builds, etc. Each command must be approved by the user before it runs. Output is captured and returned to you.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The exact command line to run." }
+                },
+                "required": ["command"]
+            }
+        },
+        {
             "name": "request_engine_change",
             "description": "Use this when the user asks for something you CANNOT do with your other tools (saving/loading projects, importing assets, file operations, new engine features or new tools). Provide a clear, specific prompt the user can paste to Claude (the desktop assistant that builds CoEngine) to add the capability. Do NOT give code to run elsewhere — call this tool instead.",
             "input_schema": {
@@ -603,6 +629,28 @@ fn execute_tool(
             *selected = None;
             let _ = tx.send(StreamMsg::Command(SceneCommand::Clear));
             "Cleared all cubes from the scene.".to_string()
+        }
+        "run_command" => {
+            let command = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if command.is_empty() {
+                return "No command was provided.".to_string();
+            }
+            // Hand the command to the main thread for approval + execution, then
+            // block until it sends back the captured output (or a denial).
+            let (reply, rx) = std::sync::mpsc::channel();
+            if tx
+                .send(StreamMsg::CommandRequest { command, reply })
+                .is_err()
+            {
+                return "The engine isn't accepting commands right now.".to_string();
+            }
+            rx.recv()
+                .unwrap_or_else(|_| "The command was cancelled.".to_string())
         }
         "request_engine_change" => {
             let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -755,6 +803,8 @@ enum DockTab {
     Explorer,
     AiChat,
     Log,
+    /// In-engine terminal (a live shell in a PTY).
+    Terminal,
     /// A file viewer opened from the Explorer; the tab is titled by file name and
     /// shows the file's text/code, or the image if it's an image.
     File(PathBuf),
@@ -834,17 +884,400 @@ fn load_file_view(ctx: &egui::Context, path: &Path) -> FileView {
     }
 }
 
+/// Which shell the in-engine terminal launches (Settings → Terminal).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum Shell {
+    #[default]
+    PowerShell,
+    Pwsh,
+    Cmd,
+}
+
+impl Shell {
+    /// The executable to launch.
+    fn command(self) -> &'static str {
+        match self {
+            Shell::PowerShell => "powershell.exe",
+            Shell::Pwsh => "pwsh.exe",
+            Shell::Cmd => "cmd.exe",
+        }
+    }
+
+    /// Human-friendly name for the Settings picker.
+    fn label(self) -> &'static str {
+        match self {
+            Shell::PowerShell => "PowerShell",
+            Shell::Pwsh => "PowerShell 7 (pwsh)",
+            Shell::Cmd => "Command Prompt (cmd)",
+        }
+    }
+}
+
+/// Run a one-shot command through the chosen shell in `cwd`, capturing
+/// stdout+stderr as a single string (truncated if very long). Used by CoE-AI's
+/// `run_command` tool — separate from the interactive Terminal so output is
+/// cleanly captured.
+fn run_captured(shell: Shell, command: &str, cwd: Option<&Path>) -> String {
+    let mut c = std::process::Command::new(shell.command());
+    match shell {
+        Shell::Cmd => {
+            c.arg("/C").arg(command);
+        }
+        Shell::PowerShell | Shell::Pwsh => {
+            c.arg("-NoProfile").arg("-Command").arg(command);
+        }
+    }
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    match c.output() {
+        Ok(out) => {
+            let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.trim().is_empty() {
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(&err);
+            }
+            if s.trim().is_empty() {
+                s = format!("(no output; exit code {})", out.status.code().unwrap_or(-1));
+            }
+            if s.len() > 8000 {
+                s.truncate(8000);
+                s.push_str("\n…(output truncated)");
+            }
+            s
+        }
+        Err(e) => format!("Failed to run command: {e}"),
+    }
+}
+
+/// A live shell running in a pseudo-terminal (ConPTY on Windows). A background
+/// thread feeds the shell's output into a `vt100` parser (the screen state);
+/// `send` writes input to the shell; `resize` keeps the PTY + parser in sync.
+struct TerminalSession {
+    /// Shared screen state, updated by the reader thread, read by the UI.
+    parser: Arc<Mutex<vt100::Parser>>,
+    /// Input side of the PTY (keystrokes/commands go here).
+    writer: Box<dyn Write + Send>,
+    /// Kept alive for resize; dropping it closes the PTY.
+    master: Box<dyn MasterPty + Send>,
+    /// The shell process; killed on drop.
+    child: Box<dyn Child + Send + Sync>,
+    rows: u16,
+    cols: u16,
+}
+
+impl TerminalSession {
+    fn spawn(shell: &str, cwd: Option<&Path>) -> std::io::Result<Self> {
+        let (rows, cols) = (24u16, 80u16);
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let mut cmd = CommandBuilder::new(shell);
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        drop(pair.slave); // release the slave so EOF propagates when the shell exits
+
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
+        let parser_rx = parser.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut p) = parser_rx.lock() {
+                            p.process(&buf[..n]);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            parser,
+            writer,
+            master: pair.master,
+            child,
+            rows,
+            cols,
+        })
+    }
+
+    /// Send bytes (typed input or a command) to the shell.
+    fn send(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+
+    /// Resize the PTY and the parser to a new grid size.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        if (rows, cols) == (self.rows, self.cols) || rows == 0 || cols == 0 {
+            return;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        if let Ok(mut p) = self.parser.lock() {
+            p.set_size(rows, cols);
+        }
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Lifecycle of the Terminal tab's shell (lazily started the first time the tab
+/// is shown, so we don't spawn a shell unless the terminal is actually used).
+enum TerminalState {
+    Off,
+    Running(TerminalSession),
+    Failed(String),
+}
+
+const TERM_BG: egui::Color32 = egui::Color32::from_rgb(16, 16, 20);
+const TERM_FG: egui::Color32 = egui::Color32::from_rgb(222, 222, 222);
+
+/// Map an ANSI 256-color index to an RGB color.
+fn ansi_256(i: u8) -> egui::Color32 {
+    const BASE: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 49, 49),
+        (13, 188, 121),
+        (229, 229, 16),
+        (36, 114, 200),
+        (188, 63, 188),
+        (17, 168, 205),
+        (229, 229, 229),
+        (102, 102, 102),
+        (241, 76, 76),
+        (35, 209, 139),
+        (245, 245, 67),
+        (59, 142, 234),
+        (214, 112, 214),
+        (41, 184, 219),
+        (255, 255, 255),
+    ];
+    if (i as usize) < 16 {
+        let (r, g, b) = BASE[i as usize];
+        egui::Color32::from_rgb(r, g, b)
+    } else if i >= 232 {
+        let v = (8 + (i as u16 - 232) * 10).min(255) as u8;
+        egui::Color32::from_rgb(v, v, v)
+    } else {
+        let i = i - 16;
+        let conv = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+        egui::Color32::from_rgb(conv(i / 36), conv((i % 36) / 6), conv(i % 6))
+    }
+}
+
+/// Resolve a vt100 cell color to an egui color (using `default` for Default).
+fn vt_to_color(c: vt100::Color, default: egui::Color32) -> egui::Color32 {
+    match c {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => ansi_256(i),
+        vt100::Color::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
+    }
+}
+
+/// Map Ctrl+letter to its control byte (Ctrl+A = 0x01 … Ctrl+Z = 0x1a).
+fn ctrl_byte(key: egui::Key) -> Option<u8> {
+    let name = key.name().as_bytes();
+    (name.len() == 1 && name[0].is_ascii_alphabetic()).then(|| name[0].to_ascii_uppercase() & 0x1f)
+}
+
+/// Translate this frame's egui input events into bytes to write to the shell.
+fn translate_terminal_input(events: &[egui::Event]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for ev in events {
+        match ev {
+            egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if (modifiers.ctrl || modifiers.command) && !modifiers.alt {
+                    if let Some(b) = ctrl_byte(*key) {
+                        out.push(b);
+                        continue;
+                    }
+                }
+                match key {
+                    egui::Key::Enter => out.push(b'\r'),
+                    egui::Key::Backspace => out.push(0x7f),
+                    egui::Key::Tab => out.push(b'\t'),
+                    egui::Key::Escape => out.push(0x1b),
+                    egui::Key::ArrowUp => out.extend_from_slice(b"\x1b[A"),
+                    egui::Key::ArrowDown => out.extend_from_slice(b"\x1b[B"),
+                    egui::Key::ArrowRight => out.extend_from_slice(b"\x1b[C"),
+                    egui::Key::ArrowLeft => out.extend_from_slice(b"\x1b[D"),
+                    egui::Key::Home => out.extend_from_slice(b"\x1b[H"),
+                    egui::Key::End => out.extend_from_slice(b"\x1b[F"),
+                    egui::Key::Delete => out.extend_from_slice(b"\x1b[3~"),
+                    egui::Key::PageUp => out.extend_from_slice(b"\x1b[5~"),
+                    egui::Key::PageDown => out.extend_from_slice(b"\x1b[6~"),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Render the Terminal tab: start the shell on first show; draw the live colored
+/// grid + cursor; resize the PTY to the tab; route keystrokes to the shell when
+/// the terminal has focus (click to focus).
+fn terminal_tab_ui(ui: &mut egui::Ui, term: &mut TerminalState, cwd: Option<&Path>, shell: &str) {
+    match term {
+        TerminalState::Off => {
+            *term = match TerminalSession::spawn(shell, cwd) {
+                Ok(t) => TerminalState::Running(t),
+                Err(e) => TerminalState::Failed(format!("Couldn't start terminal: {e}")),
+            };
+            ui.label("Starting terminal…");
+            ui.ctx().request_repaint();
+        }
+        TerminalState::Running(t) => {
+            let font_id = egui::FontId::monospace(13.0);
+            let (char_w, row_h) = ui.fonts(|f| {
+                (
+                    f.glyph_width(&font_id, 'M').max(1.0),
+                    f.row_height(&font_id).max(1.0),
+                )
+            });
+            let avail = ui.available_size();
+            let cols = ((avail.x / char_w).floor() as i32).clamp(1, 400) as u16;
+            let rows = ((avail.y / row_h).floor() as i32).clamp(1, 200) as u16;
+            t.resize(rows, cols);
+
+            let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+            if resp.clicked() {
+                resp.request_focus();
+            }
+            let focused = resp.has_focus();
+
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, TERM_BG);
+            if let Ok(parser) = t.parser.lock() {
+                let screen = parser.screen();
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let Some(cell) = screen.cell(row, col) else {
+                            continue;
+                        };
+                        let x = rect.min.x + col as f32 * char_w;
+                        let y = rect.min.y + row as f32 * row_h;
+                        let fg0 = vt_to_color(cell.fgcolor(), TERM_FG);
+                        let bg_opt = match cell.bgcolor() {
+                            vt100::Color::Default => None,
+                            c => Some(vt_to_color(c, TERM_FG)),
+                        };
+                        let (fg, bg) = if cell.inverse() {
+                            (bg_opt.unwrap_or(TERM_BG), Some(fg0))
+                        } else {
+                            (fg0, bg_opt)
+                        };
+                        let cell_rect =
+                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_w, row_h));
+                        if let Some(bg) = bg {
+                            painter.rect_filled(cell_rect, 0.0, bg);
+                        }
+                        let contents = cell.contents();
+                        if !contents.is_empty() && contents != " " {
+                            painter.text(
+                                egui::pos2(x, y),
+                                egui::Align2::LEFT_TOP,
+                                contents,
+                                font_id.clone(),
+                                fg,
+                            );
+                        }
+                    }
+                }
+                if !screen.hide_cursor() {
+                    let (cr, cc) = screen.cursor_position();
+                    let x = rect.min.x + cc as f32 * char_w;
+                    let y = rect.min.y + cr as f32 * row_h;
+                    let alpha = if focused { 160 } else { 70 };
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_w, row_h)),
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(210, 210, 210, alpha),
+                    );
+                }
+            }
+
+            if focused {
+                painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, ACCENT_GOLD));
+                let bytes = ui.input(|i| translate_terminal_input(&i.events));
+                if !bytes.is_empty() {
+                    t.send(&bytes);
+                }
+            } else {
+                painter.text(
+                    rect.left_bottom() + egui::vec2(6.0, -6.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    "click to type",
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_gray(120),
+                );
+            }
+        }
+        TerminalState::Failed(e) => {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new(e.as_str()).weak());
+            });
+        }
+    }
+}
+
 /// Which Settings category/submenu is showing.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
     Theme,
     Controls,
+    Terminal,
 }
 
 /// UI/chrome state: theme, menu/modal visibility, active tab, controls overlay.
 struct UiState {
     theme: Theme,
     dark_mode: bool,
+    /// Which shell the in-engine terminal launches.
+    shell: Shell,
     menu_open: bool,
     settings_open: bool,
     /// Which Settings submenu (Theme / Controls) is showing.
@@ -875,6 +1308,7 @@ impl Default for UiState {
         Self {
             theme: Theme::DefaultSimple,
             dark_mode: true,
+            shell: Shell::default(),
             menu_open: false,
             settings_open: false,
             settings_tab: SettingsTab::Theme,
@@ -1043,6 +1477,10 @@ struct EngineTabs<'a> {
     open_file_req: &'a mut Option<PathBuf>,
     /// Decoded file contents for `File` viewer tabs, keyed by path (lazy-loaded).
     file_cache: &'a mut HashMap<PathBuf, FileView>,
+    /// The in-engine terminal's shell session (lazily started).
+    terminal: &'a mut TerminalState,
+    /// The shell executable to launch for the terminal.
+    terminal_shell: String,
 }
 
 impl TabViewer for EngineTabs<'_> {
@@ -1055,6 +1493,7 @@ impl TabViewer for EngineTabs<'_> {
             DockTab::Explorer => "Explorer".into(),
             DockTab::AiChat => "AI Chat".into(),
             DockTab::Log => "Log".into(),
+            DockTab::Terminal => "Terminal".into(),
             DockTab::File(path) => {
                 let name = path
                     .file_name()
@@ -1106,6 +1545,14 @@ impl TabViewer for EngineTabs<'_> {
                 self.undo_req,
                 self.redo_req,
             ),
+            DockTab::Terminal => {
+                terminal_tab_ui(
+                    ui,
+                    self.terminal,
+                    self.project_root.as_deref(),
+                    &self.terminal_shell,
+                );
+            }
             DockTab::File(path) => {
                 let view = self
                     .file_cache
@@ -1218,6 +1665,8 @@ fn build_ui(
     history_cursor: usize,
     project_path: Option<&Path>,
     file_cache: &mut HashMap<PathBuf, FileView>,
+    terminal: &mut TerminalState,
+    pending_command: &mut Option<PendingCommand>,
     dock_state: &mut DockState<DockTab>,
     scene_rect_out: &mut Option<egui::Rect>,
 ) {
@@ -1340,6 +1789,7 @@ fn build_ui(
                 (DockTab::Explorer, "Explorer"),
                 (DockTab::AiChat, "AI Chat"),
                 (DockTab::Log, "Log"),
+                (DockTab::Terminal, "Terminal"),
             ];
             if tabs.iter().any(|(t, _)| dock_state.find_tab(t).is_none()) {
                 ui.separator();
@@ -1436,6 +1886,8 @@ fn build_ui(
             project_root: project_path.map(|p| p.to_path_buf()),
             open_file_req: &mut open_file_req,
             file_cache,
+            terminal: &mut *terminal,
+            terminal_shell: ui_state.shell.command().to_string(),
         };
         DockArea::new(dock_state)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -1640,6 +2092,11 @@ fn build_ui(
                             SettingsTab::Controls,
                             "Controls",
                         );
+                        ui.selectable_value(
+                            &mut ui_state.settings_tab,
+                            SettingsTab::Terminal,
+                            "Terminal",
+                        );
                     });
                     ui.add_space(14.0);
                     // Content for the selected category.
@@ -1704,6 +2161,26 @@ fn build_ui(
                                     );
                                 }
                             }
+                            SettingsTab::Terminal => {
+                                ui.label("Shell for the in-engine Terminal");
+                                ui.add_space(4.0);
+                                let before = ui_state.shell;
+                                for sh in [Shell::PowerShell, Shell::Pwsh, Shell::Cmd] {
+                                    ui.selectable_value(&mut ui_state.shell, sh, sh.label());
+                                }
+                                if ui_state.shell != before {
+                                    // Restart the terminal with the newly chosen shell.
+                                    *terminal = TerminalState::Off;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Changing the shell restarts the Terminal.",
+                                    )
+                                    .small()
+                                    .italics(),
+                                );
+                            }
                         }
                     });
                 });
@@ -1715,6 +2192,64 @@ fn build_ui(
                     ui_state.settings_open = false;
                     ui_state.rebinding = None;
                 }
+            });
+    }
+
+    // CoE-AI command approval (confirm-each): the agent's worker thread is blocked
+    // until the user approves (runs the command) or denies it.
+    if pending_command.is_some() {
+        egui::Window::new("cmd_confirm")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("CoE-AI wants to run a terminal command")
+                        .strong()
+                        .color(ACCENT_GOLD),
+                );
+                ui.add_space(6.0);
+                let cmd_text = pending_command
+                    .as_ref()
+                    .map(|p| p.command.clone())
+                    .unwrap_or_default();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&cmd_text).monospace())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(
+                            egui::RichText::new("Approve & Run")
+                                .color(egui::Color32::from_rgb(220, 230, 220)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(pc) = pending_command.take() {
+                            let shell = ui_state.shell;
+                            let cwd = project_path.map(|p| p.to_path_buf());
+                            std::thread::spawn(move || {
+                                let out = run_captured(shell, &pc.command, cwd.as_deref());
+                                let _ = pc.reply.send(out);
+                            });
+                        }
+                    }
+                    if ui.button("Deny").clicked() {
+                        if let Some(pc) = pending_command.take() {
+                            let _ = pc
+                                .reply
+                                .send("The user denied running this command.".to_string());
+                        }
+                    }
+                });
+                ui.add_space(8.0);
             });
     }
 }
@@ -2136,6 +2671,9 @@ struct Project {
     dark_mode: bool,
     /// Remappable control bindings (keymap).
     controls: Controls,
+    /// Terminal shell choice. `default` keeps pre-v0.0.14 manifests loadable.
+    #[serde(default)]
+    shell: Shell,
     /// Dockable workspace layout.
     dock_state: DockState<DockTab>,
     /// Last window inner size in physical pixels, if known.
@@ -2160,6 +2698,8 @@ struct GlobalConfig {
     dark_mode: Option<bool>,
     /// Last-used control bindings.
     controls: Option<Controls>,
+    /// Last-used terminal shell.
+    shell: Option<Shell>,
 }
 
 /// Path to the global config file, creating `%APPDATA%\CoEngine\` if needed.
@@ -2280,6 +2820,10 @@ struct State {
     startup_last_project: Option<PathBuf>,
     /// Lazy cache of decoded file contents for open `File` viewer tabs.
     file_cache: HashMap<PathBuf, FileView>,
+    /// The in-engine terminal's shell (lazily started when the tab is shown).
+    terminal: TerminalState,
+    /// A terminal command CoE-AI proposed, awaiting the user's approve/deny.
+    pending_command: Option<PendingCommand>,
 }
 
 impl State {
@@ -2493,6 +3037,9 @@ impl State {
         if let Some(d) = cfg.dark_mode {
             ui.dark_mode = d;
         }
+        if let Some(s) = cfg.shell {
+            ui.shell = s;
+        }
         let startup_last_project = cfg
             .last_project
             .filter(|p| p.join("project.json").is_file());
@@ -2557,6 +3104,8 @@ impl State {
             project_path: None,
             startup_last_project,
             file_cache: HashMap::new(),
+            terminal: TerminalState::Off,
+            pending_command: None,
         }
     }
 
@@ -2733,6 +3282,7 @@ impl State {
             theme: self.ui.theme,
             dark_mode: self.ui.dark_mode,
             controls: self.controls,
+            shell: self.ui.shell,
             dock_state: self.dock_state.clone(),
             window_size: Some((self.config.width, self.config.height)),
             window_pos: self
@@ -2753,7 +3303,10 @@ impl State {
         self.ui.theme = p.theme;
         self.ui.dark_mode = p.dark_mode;
         self.controls = p.controls;
+        self.ui.shell = p.shell;
         self.dock_state = p.dock_state;
+        // Restart the terminal so it uses the loaded project's shell.
+        self.terminal = TerminalState::Off;
 
         // The loaded scene becomes the new history baseline (undo can't go past it).
         self.history = vec![HistoryEntry {
@@ -2895,6 +3448,7 @@ impl State {
             theme: Some(self.ui.theme),
             dark_mode: Some(self.ui.dark_mode),
             controls: Some(self.controls),
+            shell: Some(self.ui.shell),
         });
     }
 
@@ -3005,6 +3559,7 @@ impl State {
         let mut deltas: Vec<String> = Vec::new();
         let mut commands: Vec<SceneCommand> = Vec::new();
         let mut claude_prompt: Option<String> = None;
+        let mut command_request: Option<PendingCommand> = None;
         let mut done = false;
         let mut error: Option<String> = None;
         if let Some(rx) = &self.chat.rx {
@@ -3013,6 +3568,12 @@ impl State {
                     Ok(StreamMsg::Delta(t)) => deltas.push(t),
                     Ok(StreamMsg::Command(c)) => commands.push(c),
                     Ok(StreamMsg::ClaudePrompt(p)) => claude_prompt = Some(p),
+                    Ok(StreamMsg::CommandRequest { command, reply }) => {
+                        command_request = Some(PendingCommand { command, reply });
+                        // Stop draining; wait for the user to approve/deny before
+                        // more agent traffic (the worker is blocked on the reply).
+                        break;
+                    }
                     Ok(StreamMsg::Done) => {
                         done = true;
                         break;
@@ -3076,6 +3637,10 @@ impl State {
 
         if let Some(p) = claude_prompt {
             self.chat.pending_claude_prompt = Some(p);
+        }
+
+        if command_request.is_some() {
+            self.pending_command = command_request;
         }
 
         if !deltas.is_empty() || done {
@@ -3197,6 +3762,8 @@ impl State {
         };
         let project_path = self.project_path.clone();
         let file_cache = &mut self.file_cache;
+        let terminal = &mut self.terminal;
+        let pending_command = &mut self.pending_command;
         let chat = &mut self.chat;
         let ui_state = &mut self.ui;
         let controls = &self.controls;
@@ -3219,6 +3786,8 @@ impl State {
                 history_cursor,
                 project_path.as_deref(),
                 file_cache,
+                terminal,
+                pending_command,
                 dock_state,
                 &mut captured_scene_rect,
             )

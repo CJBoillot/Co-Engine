@@ -47,7 +47,7 @@
             "Leaf": {
               "rect": { "min": { "x": 283.2, "y": 51.0 }, "max": { "x": 1014.4, "y": 251.2 } },
               "viewport": { "min": { "x": 283.2, "y": 75.00001 }, "max": { "x": 1014.4, "y": 251.20001 } },
-              "tabs": ["Logic"],
+              "tabs": ["Logic", "Terminal"],
               "active": 0,
               "scroll": 0.0
             }
