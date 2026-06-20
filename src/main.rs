@@ -16,6 +16,7 @@
 //!   Fly:   WASD move · E/Q up/down · right-drag look · click select · C add · Del remove · Tab Orbit
 //!   Esc quits.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -42,7 +43,7 @@ const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.12";
+const CO_VERSION: &str = "0.0.13";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -742,14 +743,95 @@ enum Theme {
     Barbarian,
 }
 
-/// The dockable widgets/windows of the engine workspace.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// The dockable widgets/windows of the engine workspace. Not `Copy` because
+/// `File` carries a path.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum DockTab {
     Scene,
     Logic,
-    Code,
+    /// Project file tree (IDE-style). `alias = "Code"` keeps v0.0.12 layouts
+    /// (which serialized this tab as "Code") loadable.
+    #[serde(alias = "Code")]
+    Explorer,
     AiChat,
     Log,
+    /// A file viewer opened from the Explorer; the tab is titled by file name and
+    /// shows the file's text/code, or the image if it's an image.
+    File(PathBuf),
+}
+
+/// Cached, decoded contents of a file shown in a `DockTab::File` viewer.
+enum FileView {
+    /// Editable text/code; `dirty` = edited since last load/save.
+    Text { buf: String, dirty: bool },
+    Image(egui::TextureHandle),
+    Binary,
+    Error(String),
+}
+
+impl FileView {
+    /// True if this is text with unsaved edits.
+    fn is_dirty(&self) -> bool {
+        matches!(self, FileView::Text { dirty: true, .. })
+    }
+}
+
+/// Write a cached text file back to disk and clear its dirty flag. No-op for
+/// non-text views. Returns any I/O error.
+fn save_file(path: &Path, cache: &mut HashMap<PathBuf, FileView>) -> std::io::Result<()> {
+    if let Some(FileView::Text { buf, dirty }) = cache.get_mut(path) {
+        std::fs::write(path, buf.as_bytes())?;
+        *dirty = false;
+    }
+    Ok(())
+}
+
+/// Is this path an image we can decode (by extension)?
+fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
+    )
+}
+
+/// Load + decode a file for the viewer: an image becomes a texture, a UTF-8 file
+/// becomes text, anything else is flagged binary. Errors are surfaced, not fatal.
+fn load_file_view(ctx: &egui::Context, path: &Path) -> FileView {
+    if is_image_path(path) {
+        return match std::fs::read(path) {
+            Ok(bytes) => match image::load_from_memory(&bytes) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    );
+                    let tex = ctx.load_texture(
+                        format!("file:{}", path.display()),
+                        ci,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    FileView::Image(tex)
+                }
+                Err(e) => FileView::Error(format!("Couldn't decode image: {e}")),
+            },
+            Err(e) => FileView::Error(format!("Couldn't read file: {e}")),
+        };
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => FileView::Text {
+                buf: s,
+                dirty: false,
+            },
+            Err(_) => FileView::Binary,
+        },
+        Err(e) => FileView::Error(format!("Couldn't read file: {e}")),
+    }
 }
 
 /// Which Settings category/submenu is showing.
@@ -954,6 +1036,13 @@ struct EngineTabs<'a> {
     undo_req: &'a mut bool,
     redo_req: &'a mut bool,
     scene_rect_out: &'a mut Option<egui::Rect>,
+    /// Root of the Explorer tree (the open project folder; None = no project).
+    project_root: Option<PathBuf>,
+    /// Set when the user clicks a file in the Explorer (handled after the dock
+    /// pass, since adding a tab needs `&mut DockState`).
+    open_file_req: &'a mut Option<PathBuf>,
+    /// Decoded file contents for `File` viewer tabs, keyed by path (lazy-loaded).
+    file_cache: &'a mut HashMap<PathBuf, FileView>,
 }
 
 impl TabViewer for EngineTabs<'_> {
@@ -961,13 +1050,25 @@ impl TabViewer for EngineTabs<'_> {
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         match tab {
-            DockTab::Scene => "3D Scene",
-            DockTab::Logic => "Logic",
-            DockTab::Code => "Code",
-            DockTab::AiChat => "AI Chat",
-            DockTab::Log => "Log",
+            DockTab::Scene => "3D Scene".into(),
+            DockTab::Logic => "Logic".into(),
+            DockTab::Explorer => "Explorer".into(),
+            DockTab::AiChat => "AI Chat".into(),
+            DockTab::Log => "Log".into(),
+            DockTab::File(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                // VS Code-style unsaved indicator: a dot before the name.
+                let dirty = self.file_cache.get(path).is_some_and(FileView::is_dirty);
+                if dirty {
+                    format!("● {name}").into()
+                } else {
+                    name.into()
+                }
+            }
         }
-        .into()
     }
 
     /// The 3D Scene tab is transparent so the wgpu viewport renders through it.
@@ -986,11 +1087,17 @@ impl TabViewer for EngineTabs<'_> {
                     ui.label(egui::RichText::new("Logic — coming soon").heading().weak());
                 });
             }
-            DockTab::Code => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Code — coming soon").heading().weak());
-                });
-            }
+            DockTab::Explorer => match &self.project_root {
+                Some(root) => file_tree_ui(ui, root, self.open_file_req),
+                None => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("No project open\nMenu → New / Open Project")
+                                .weak(),
+                        );
+                    });
+                }
+            },
             DockTab::AiChat => chat_tab(ui, self.chat, self.scene),
             DockTab::Log => log_tab(
                 ui,
@@ -999,6 +1106,98 @@ impl TabViewer for EngineTabs<'_> {
                 self.undo_req,
                 self.redo_req,
             ),
+            DockTab::File(path) => {
+                let view = self
+                    .file_cache
+                    .entry(path.clone())
+                    .or_insert_with(|| load_file_view(ui.ctx(), path.as_path()));
+                file_view_ui(ui, view);
+            }
+        }
+    }
+}
+
+/// Render a loaded file: code/text in a read-only code editor, an image scaled
+/// to fit, or a placeholder for binary/error.
+fn file_view_ui(ui: &mut egui::Ui, view: &mut FileView) {
+    match view {
+        FileView::Text { buf, dirty } => {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Editable code/text; mark dirty on edit (saved via the toolbar).
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(buf)
+                            .code_editor()
+                            .desired_width(f32::INFINITY),
+                    );
+                    if resp.changed() {
+                        *dirty = true;
+                    }
+                });
+        }
+        FileView::Image(tex) => {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let avail = ui.available_width();
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(tex.id(), tex.size_vec2()))
+                            .max_width(avail),
+                    );
+                });
+        }
+        FileView::Binary => {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("Binary file — can't display as text").weak());
+            });
+        }
+        FileView::Error(e) => {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new(e.as_str()).weak());
+            });
+        }
+    }
+}
+
+/// Explorer: an IDE-style file tree rooted at the project folder. The project
+/// folder is the top of the hierarchy — nothing above it is reachable. Clicking
+/// a file records it in `open` (the caller opens a viewer tab for it).
+fn file_tree_ui(ui: &mut egui::Ui, root: &Path, open: &mut Option<PathBuf>) {
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            ui.label(egui::RichText::new(name).strong().color(ACCENT_GOLD));
+            ui.separator();
+            dir_contents_ui(ui, root, open);
+        });
+}
+
+/// Recursively render one directory's children (folders first, then files,
+/// case-insensitive). Folders are collapsing headers; files are clickable.
+fn dir_contents_ui(ui: &mut egui::Ui, dir: &Path, open: &mut Option<PathBuf>) {
+    let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.flatten().collect(),
+        Err(_) => return,
+    };
+    entries.sort_by_key(|e| {
+        let is_dir = e.path().is_dir();
+        (!is_dir, e.file_name().to_string_lossy().to_lowercase())
+    });
+    for e in entries {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            egui::CollapsingHeader::new(name)
+                .id_salt(&path)
+                .default_open(false)
+                .show(ui, |ui| dir_contents_ui(ui, &path, open));
+        } else if ui.selectable_label(false, name).clicked() {
+            *open = Some(path);
         }
     }
 }
@@ -1017,6 +1216,8 @@ fn build_ui(
     controls: &Controls,
     history: &[HistoryEntry],
     history_cursor: usize,
+    project_path: Option<&Path>,
+    file_cache: &mut HashMap<PathBuf, FileView>,
     dock_state: &mut DockState<DockTab>,
     scene_rect_out: &mut Option<egui::Rect>,
 ) {
@@ -1136,7 +1337,7 @@ fn build_ui(
             let tabs = [
                 (DockTab::Scene, "3D Scene"),
                 (DockTab::Logic, "Logic"),
-                (DockTab::Code, "Code"),
+                (DockTab::Explorer, "Explorer"),
                 (DockTab::AiChat, "AI Chat"),
                 (DockTab::Log, "Log"),
             ];
@@ -1166,33 +1367,106 @@ fn build_ui(
     });
 
     // Tool row (scene tools will live here later).
+    // Tool row: Save / Save All for the active file viewer (also Ctrl+S).
+    let active_file: Option<PathBuf> = dock_state.find_active_focused().and_then(|(_, tab)| {
+        match tab {
+            DockTab::File(p) => Some(p.clone()),
+            _ => None,
+        }
+    });
+    let active_dirty = active_file
+        .as_ref()
+        .is_some_and(|p| file_cache.get(p).is_some_and(FileView::is_dirty));
+    let any_dirty = file_cache.values().any(FileView::is_dirty);
+    let mut do_save = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
+    let mut do_save_all = false;
     egui::TopBottomPanel::top("tool_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
+            if ui
+                .add_enabled(active_dirty, egui::Button::new("Save"))
+                .on_hover_text("Save the active file (Ctrl+S)")
+                .clicked()
+            {
+                do_save = true;
+            }
+            if ui
+                .add_enabled(any_dirty, egui::Button::new("Save All"))
+                .clicked()
+            {
+                do_save_all = true;
+            }
+            ui.separator();
             ui.label(egui::RichText::new("Tools").small());
         });
     });
+    if do_save && active_dirty {
+        if let Some(p) = active_file {
+            match save_file(&p, file_cache) {
+                Ok(()) => println!("Saved {}", p.display()),
+                Err(e) => eprintln!("Save failed: {e}"),
+            }
+        }
+    }
+    if do_save_all {
+        let dirty: Vec<PathBuf> = file_cache
+            .iter()
+            .filter(|(_, v)| v.is_dirty())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for p in dirty {
+            if let Err(e) = save_file(&p, file_cache) {
+                eprintln!("Save failed for {}: {e}", p.display());
+            }
+        }
+    }
 
     // The dockable workspace fills the central area. Each tab can be dragged into a
     // column or a full-screen tab and resized; the 3D Scene tab is the live viewport.
-    let mut viewer = EngineTabs {
-        chat,
-        scene,
-        history,
-        history_cursor,
-        undo_req: &mut ui_state.undo_requested,
-        redo_req: &mut ui_state.redo_requested,
-        scene_rect_out,
-    };
-    DockArea::new(dock_state)
-        .style(Style::from_egui(ctx.style().as_ref()))
-        .show(ctx, &mut viewer);
+    let mut open_file_req: Option<PathBuf> = None;
+    {
+        let mut viewer = EngineTabs {
+            chat,
+            scene,
+            history,
+            history_cursor,
+            undo_req: &mut ui_state.undo_requested,
+            redo_req: &mut ui_state.redo_requested,
+            scene_rect_out: &mut *scene_rect_out,
+            project_root: project_path.map(|p| p.to_path_buf()),
+            open_file_req: &mut open_file_req,
+            file_cache,
+        };
+        DockArea::new(dock_state)
+            .style(Style::from_egui(ctx.style().as_ref()))
+            .show(ctx, &mut viewer);
+    }
+    // The 3D Scene tab's rect this frame (None when the Scene tab isn't visible).
+    let scene_rect = *scene_rect_out;
 
-    // Bottom-left debug overlay: controls + version on a dark plate so the text is
-    // readable over the 3D viewport. Hidden entirely with H (re-shown via the top bar).
+    // A file was clicked in the Explorer: open (or focus) a viewer tab for it,
+    // docked in the same leaf as Logic (top-center) when Logic is present.
+    if let Some(path) = open_file_req {
+        let tab = DockTab::File(path);
+        if let Some(loc) = dock_state.find_tab(&tab) {
+            dock_state.set_active_tab(loc);
+        } else {
+            if let Some((surface, node, _)) = dock_state.find_tab(&DockTab::Logic) {
+                dock_state.set_focused_node_and_surface((surface, node));
+            }
+            dock_state.push_to_focused_leaf(tab);
+        }
+    }
+
+    // Bottom-left debug overlay: controls + version on a dark plate, confined to
+    // the 3D Scene viewport and only shown when the Scene tab is visible. Hidden
+    // entirely with H (re-shown via the top bar).
     if ui_state.show_debug {
+        if let Some(rect) = scene_rect {
         egui::Area::new(egui::Id::new("hud_bottom_left"))
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -10.0))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(egui::pos2(rect.left() + 10.0, rect.bottom() - 10.0))
+            .constrain_to(rect)
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::none()
@@ -1244,6 +1518,7 @@ fn build_ui(
                         );
                     });
             });
+        }
     }
 
     // Menu window (opened by Esc or the Menu button).
@@ -1934,7 +2209,7 @@ fn fallback_dock_state() -> DockState<DockTab> {
     let surface = state.main_surface_mut();
     let [main, aichat] = surface.split_right(NodeIndex::root(), 0.6, vec![DockTab::AiChat]);
     let [_aichat, _log] = surface.split_right(aichat, 0.5, vec![DockTab::Log]);
-    let [_main, _code] = surface.split_right(main, 0.72, vec![DockTab::Code]);
+    let [_main, _explorer] = surface.split_right(main, 0.72, vec![DockTab::Explorer]);
     state
 }
 
@@ -2003,6 +2278,8 @@ struct State {
     project_path: Option<PathBuf>,
     /// The last-used project folder from the global config (for "Open last").
     startup_last_project: Option<PathBuf>,
+    /// Lazy cache of decoded file contents for open `File` viewer tabs.
+    file_cache: HashMap<PathBuf, FileView>,
 }
 
 impl State {
@@ -2279,6 +2556,7 @@ impl State {
             startup_splash: true,
             project_path: None,
             startup_last_project,
+            file_cache: HashMap::new(),
         }
     }
 
@@ -2917,6 +3195,8 @@ impl State {
             cubes: self.cubes.iter().map(|c| (c.pos, c.color)).collect(),
             selected: self.selected,
         };
+        let project_path = self.project_path.clone();
+        let file_cache = &mut self.file_cache;
         let chat = &mut self.chat;
         let ui_state = &mut self.ui;
         let controls = &self.controls;
@@ -2937,6 +3217,8 @@ impl State {
                 controls,
                 history,
                 history_cursor,
+                project_path.as_deref(),
+                file_cache,
                 dock_state,
                 &mut captured_scene_rect,
             )

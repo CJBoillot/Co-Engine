@@ -28,7 +28,7 @@
             "Leaf": {
               "rect": { "min": { "x": 0.0, "y": 51.0 }, "max": { "x": 282.4, "y": 720.0 } },
               "viewport": { "min": { "x": 0.0, "y": 75.0 }, "max": { "x": 282.4, "y": 720.0 } },
-              "tabs": ["Code"],
+              "tabs": ["Explorer"],
               "active": 0,
               "scroll": 0.0
             }
