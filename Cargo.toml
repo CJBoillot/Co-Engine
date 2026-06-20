@@ -1,6 +1,6 @@
 [package]
 name = "coengine"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 
 [dependencies]
@@ -9,6 +9,7 @@ egui = "0.29"
 egui-wgpu = "0.29"
 egui-winit = "0.29"
 glam = "0.33.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "0.3"
 serde_json = "1.0.150"
 ureq = "2"

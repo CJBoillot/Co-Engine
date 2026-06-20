@@ -37,10 +37,34 @@ const CUBE_HALF: f32 = 0.5;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.6";
+const CO_VERSION: &str = "0.0.7";
 
-/// The Claude model the chat panel talks to.
-const CLAUDE_MODEL: &str = "claude-opus-4-8";
+/// A Claude model the in-engine chat can use. `effort` marks models that accept
+/// the `output_config.effort` speed control (Haiku 4.5 does not).
+struct ModelChoice {
+    name: &'static str,
+    id: &'static str,
+    effort: bool,
+}
+
+/// Models offered in the chat's Model dropdown, fastest/cheapest first.
+const MODELS: &[ModelChoice] = &[
+    ModelChoice { name: "Haiku 4.5 — fastest", id: "claude-haiku-4-5", effort: false },
+    ModelChoice { name: "Sonnet 4.6 — balanced", id: "claude-sonnet-4-6", effort: true },
+    ModelChoice { name: "Opus 4.8 — most capable", id: "claude-opus-4-8", effort: true },
+    ModelChoice { name: "Fable 5 — most powerful", id: "claude-fable-5", effort: true },
+];
+
+/// Speed presets → the API `effort` value (effort-capable models only).
+const EFFORTS: &[(&str, &str)] = &[
+    ("Fast", "low"),
+    ("Balanced", "medium"),
+    ("High", "high"),
+    ("Max", "max"),
+];
+
+const DEFAULT_MODEL_IDX: usize = 0; // Haiku 4.5 (cheapest/fastest, default)
+const DEFAULT_EFFORT_IDX: usize = 1; // Balanced
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -211,6 +235,37 @@ struct ChatUi {
     streaming_index: Option<usize>,
     /// A short status/error line shown under the header.
     status: String,
+    /// Currently selected model + speed (indices into MODELS / EFFORTS).
+    model_idx: usize,
+    effort_idx: usize,
+}
+
+/// Find the Anthropic API key: the ANTHROPIC_API_KEY environment variable first,
+/// then a local `.env` file (a line like `ANTHROPIC_API_KEY=sk-ant-...`). The
+/// `.env` file is gitignored, so the key is never committed.
+fn load_api_key() -> Option<String> {
+    if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
+        if !k.trim().is_empty() {
+            return Some(k.trim().to_string());
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string(".env") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, val)) = line.split_once('=') {
+                if key.trim() == "ANTHROPIC_API_KEY" {
+                    let val = val.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Send the current input to Claude (real, streaming). Ignored if a reply is
@@ -225,14 +280,14 @@ fn send_message(chat: &mut ChatUi) {
     }
     chat.input.clear();
 
-    // Read the API key from the environment (never stored in the repo).
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => k,
-        _ => {
+    // Find the API key: env var first, then a local .env file. Never in the repo.
+    let api_key = match load_api_key() {
+        Some(k) => k,
+        None => {
             chat.messages.push(ChatMessage { role: Role::User, text });
             chat.messages.push(ChatMessage {
                 role: Role::Assistant,
-                text: "ANTHROPIC_API_KEY is not set. In a terminal run:\n  setx ANTHROPIC_API_KEY \"sk-ant-...\"\nthen restart the app."
+                text: "No API key found. Paste your key into the .env file in the project folder (ANTHROPIC_API_KEY=sk-ant-...) and save, then send again — no restart needed. (Or set the ANTHROPIC_API_KEY environment variable.)"
                     .to_string(),
             });
             chat.status = "API key not set".to_string();
@@ -242,6 +297,16 @@ fn send_message(chat: &mut ChatUi) {
 
     // Record the user's message.
     chat.messages.push(ChatMessage { role: Role::User, text });
+
+    // Resolve the chosen model + speed.
+    let model = &MODELS[chat.model_idx.min(MODELS.len() - 1)];
+    let model_id = model.id.to_string();
+    let model_name = model.name;
+    let effort: Option<&'static str> = if model.effort {
+        Some(EFFORTS[chat.effort_idx.min(EFFORTS.len() - 1)].1)
+    } else {
+        None
+    };
 
     // Build the API conversation from everything so far.
     let api_messages: Vec<serde_json::Value> = chat
@@ -253,23 +318,35 @@ fn send_message(chat: &mut ChatUi) {
     // Create the empty assistant message the stream will fill in.
     chat.messages.push(ChatMessage { role: Role::Assistant, text: String::new() });
     chat.streaming_index = Some(chat.messages.len() - 1);
-    chat.status = "Claude is replying…".to_string();
+    chat.status = format!("{model_name} is replying…");
 
     // Do the blocking, streaming HTTP request off the UI thread.
     let (tx, rx) = std::sync::mpsc::channel();
     chat.rx = Some(rx);
-    std::thread::spawn(move || stream_claude(api_key, api_messages, tx));
+    std::thread::spawn(move || stream_claude(api_key, model_id, effort, api_messages, tx));
 }
 
 /// Worker thread: POST to the Anthropic Messages API and stream the reply,
 /// forwarding text deltas to the UI over `tx`.
-fn stream_claude(api_key: String, messages: Vec<serde_json::Value>, tx: Sender<StreamMsg>) {
-    let body = serde_json::json!({
-        "model": CLAUDE_MODEL,
+fn stream_claude(
+    api_key: String,
+    model_id: String,
+    effort: Option<&'static str>,
+    messages: Vec<serde_json::Value>,
+    tx: Sender<StreamMsg>,
+) {
+    let mut body = serde_json::json!({
+        "model": model_id,
         "max_tokens": 1024,
         "stream": true,
         "messages": messages,
     });
+    // Effort-capable models get the speed control + adaptive thinking, so a
+    // higher "Speed" setting genuinely makes Claude think harder.
+    if let Some(eff) = effort {
+        body["output_config"] = serde_json::json!({ "effort": eff });
+        body["thinking"] = serde_json::json!({ "type": "adaptive" });
+    }
     let body_str = serde_json::to_string(&body).unwrap_or_default();
 
     let response = ureq::post("https://api.anthropic.com/v1/messages")
@@ -358,11 +435,37 @@ fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
             egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Chat");
-                ui.label(
-                    egui::RichText::new(format!("Claude · {CLAUDE_MODEL}"))
-                        .weak()
-                        .small(),
-                );
+
+                // Model selector (speed + cost).
+                ui.horizontal(|ui| {
+                    ui.label("Model:");
+                    egui::ComboBox::from_id_salt("model_select")
+                        .selected_text(MODELS[chat.model_idx].name)
+                        .show_ui(ui, |ui| {
+                            for (i, m) in MODELS.iter().enumerate() {
+                                ui.selectable_value(&mut chat.model_idx, i, m.name);
+                            }
+                        });
+                });
+
+                // Speed selector (the API effort level) — disabled for Haiku.
+                let effort_capable = MODELS[chat.model_idx].effort;
+                ui.horizontal(|ui| {
+                    ui.label("Speed:");
+                    ui.add_enabled_ui(effort_capable, |ui| {
+                        egui::ComboBox::from_id_salt("speed_select")
+                            .selected_text(EFFORTS[chat.effort_idx].0)
+                            .show_ui(ui, |ui| {
+                                for (i, e) in EFFORTS.iter().enumerate() {
+                                    ui.selectable_value(&mut chat.effort_idx, i, e.0);
+                                }
+                            });
+                    });
+                    if !effort_capable {
+                        ui.label(egui::RichText::new("(n/a for Haiku)").weak().small());
+                    }
+                });
+
                 if !chat.status.is_empty() {
                     ui.label(egui::RichText::new(&chat.status).small().italics());
                 }
@@ -800,7 +903,11 @@ impl State {
             egui_ctx,
             egui_state,
             egui_renderer,
-            chat: ChatUi::default(),
+            chat: ChatUi {
+                model_idx: DEFAULT_MODEL_IDX,
+                effort_idx: DEFAULT_EFFORT_IDX,
+                ..Default::default()
+            },
         }
     }
 
@@ -1132,6 +1239,16 @@ impl State {
     }
 }
 
+/// Load the engine logo from `assets/icon.png` as RGBA8 bytes + dimensions.
+/// Returns None if the file is missing or can't be decoded (the app still runs).
+fn load_logo_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    let bytes = std::fs::read("assets/icon.png").ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((rgba.into_raw(), w, h))
+}
+
 fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -1168,9 +1285,18 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let attributes = Window::default_attributes()
+        // Load the logo (assets/icon.png) for the window icon + the in-UI overlay.
+        let logo = load_logo_rgba();
+
+        let mut attributes = Window::default_attributes()
             .with_title(title_for(CameraMode::Orbit))
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
+
+        if let Some((rgba, w, h)) = &logo {
+            if let Ok(icon) = winit::window::Icon::from_rgba(rgba.clone(), *w, *h) {
+                attributes = attributes.with_window_icon(Some(icon));
+            }
+        }
 
         let window = Arc::new(
             event_loop
