@@ -1,24 +1,21 @@
-//! CoEngine — Milestone 1, Step 3: "Add a Cube"
+//! CoEngine — Milestone 1, Step 4: "Select & Remove"
 //!
-//! Builds on Step 2 (orbit + free-fly cameras). New in this step:
-//!   * **solid 3D geometry** — a unit cube drawn as triangles, lit by simple
-//!     per-face shading, sitting correctly in the scene via the depth buffer,
-//!   * a **scene** — a list of cube positions you can grow,
-//!   * **press `C`** to spawn another cube (they fill a tidy grid of slots).
-//!
-//! Versioning: the SemVer version lives in Cargo.toml and is shown in the title
-//! bar (an in-viewport bottom-left watermark arrives with egui in Step 5).
+//! Builds on Step 3 (add cubes with C). New in this step:
+//!   * **click a cube to select it** — it highlights in yellow,
+//!   * **Delete / Backspace** removes the selected cube,
+//!   * selection uses **ray picking**: a mouse click is turned into a 3D ray and
+//!     tested against each cube's bounding box; the nearest hit wins.
 //!
 //! Controls:
-//!   Orbit mode: left-drag orbit · right-drag pan · scroll zoom · C add cube · Tab -> Fly
-//!   Fly mode:   WASD move · E/Q (or Space) up/down · right-drag look · C add cube · Tab -> Orbit
+//!   Orbit mode: left-drag orbit · right-drag pan · scroll zoom · click select · C add · Del remove · Tab -> Fly
+//!   Fly mode:   WASD move · E/Q (or Space) up/down · right-drag look · click select · C add · Del remove · Tab -> Orbit
 //!   Esc quits.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -30,6 +27,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Half-size of a cube (cubes are 1×1×1). Used for picking too.
+const CUBE_HALF: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -55,14 +55,13 @@ impl Vertex {
     }
 }
 
-/// The ground grid as line endpoints (drawn as a LineList).
 fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     let mut verts = Vec::new();
     let max = half as f32 * spacing;
 
     let gray = [0.32, 0.32, 0.34];
-    let x_axis = [0.85, 0.25, 0.25]; // red
-    let z_axis = [0.25, 0.45, 0.90]; // blue
+    let x_axis = [0.85, 0.25, 0.25];
+    let z_axis = [0.25, 0.45, 0.90];
 
     for i in -half..=half {
         let p = i as f32 * spacing;
@@ -79,19 +78,15 @@ fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     verts
 }
 
-/// Push two triangles (a quad face) with a flat color into `out`.
 fn push_quad(out: &mut Vec<Vertex>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], color: [f32; 3]) {
     for pos in [a, b, c, a, c, d] {
         out.push(Vertex { position: pos, color });
     }
 }
 
-/// A unit cube (1×1×1) centered at the origin, 36 vertices (12 triangles).
-/// Each face gets a different brightness to fake shading so the form reads as 3D.
 fn unit_cube() -> Vec<Vertex> {
-    let s = 0.5;
+    let s = CUBE_HALF;
 
-    // Face colors: a warm orange, brighter on top, darker underneath.
     let top = [0.92, 0.64, 0.32];
     let bottom = [0.42, 0.27, 0.13];
     let front = [0.84, 0.55, 0.27];
@@ -99,7 +94,6 @@ fn unit_cube() -> Vec<Vertex> {
     let right = [0.76, 0.49, 0.24];
     let left = [0.70, 0.45, 0.22];
 
-    // 8 corners.
     let p000 = [-s, -s, -s];
     let p001 = [-s, -s, s];
     let p010 = [-s, s, -s];
@@ -110,30 +104,58 @@ fn unit_cube() -> Vec<Vertex> {
     let p111 = [s, s, s];
 
     let mut v = Vec::with_capacity(36);
-    push_quad(&mut v, p010, p011, p111, p110, top); // +Y
-    push_quad(&mut v, p000, p100, p101, p001, bottom); // -Y
-    push_quad(&mut v, p001, p101, p111, p011, front); // +Z
-    push_quad(&mut v, p100, p000, p010, p110, back); // -Z
-    push_quad(&mut v, p101, p100, p110, p111, right); // +X
-    push_quad(&mut v, p000, p001, p011, p010, left); // -X
+    push_quad(&mut v, p010, p011, p111, p110, top);
+    push_quad(&mut v, p000, p100, p101, p001, bottom);
+    push_quad(&mut v, p001, p101, p111, p011, front);
+    push_quad(&mut v, p100, p000, p010, p110, back);
+    push_quad(&mut v, p101, p100, p110, p111, right);
+    push_quad(&mut v, p000, p001, p011, p010, left);
     v
 }
 
-/// Build one combined vertex buffer's worth of cube geometry: the unit cube
-/// copied to each position in `positions`. (Simple and fine for small counts;
-/// later steps can switch to GPU instancing.)
-fn build_cube_vertices(positions: &[Vec3]) -> Vec<Vertex> {
+/// Build cube geometry for the whole scene. The selected cube (if any) is tinted
+/// yellow so it stands out.
+fn build_cube_vertices(positions: &[Vec3], selected: Option<usize>) -> Vec<Vertex> {
     let base = unit_cube();
     let mut out = Vec::with_capacity(positions.len() * base.len());
-    for p in positions {
+
+    for (i, p) in positions.iter().enumerate() {
+        let highlight = Some(i) == selected;
         for v in &base {
+            let color = if highlight {
+                // Blend the face color toward bright yellow.
+                [
+                    v.color[0] * 0.4 + 1.00 * 0.6,
+                    v.color[1] * 0.4 + 0.95 * 0.6,
+                    v.color[2] * 0.4 + 0.30 * 0.6,
+                ]
+            } else {
+                v.color
+            };
             out.push(Vertex {
                 position: [v.position[0] + p.x, v.position[1] + p.y, v.position[2] + p.z],
-                color: v.color,
+                color,
             });
         }
     }
     out
+}
+
+/// Ray vs axis-aligned bounding box (the "slab" method). Returns the distance
+/// `t` along the ray to the first intersection, or None if it misses.
+fn ray_aabb(origin: Vec3, dir: Vec3, center: Vec3, half: f32) -> Option<f32> {
+    let min = center - Vec3::splat(half);
+    let max = center + Vec3::splat(half);
+    let inv = Vec3::ONE / dir; // component-wise; zero dir -> inf, handled by min/max
+    let t0 = (min - origin) * inv;
+    let t1 = (max - origin) * inv;
+    let t_enter = t0.min(t1).max_element();
+    let t_exit = t0.max(t1).min_element();
+    if t_enter <= t_exit && t_exit >= 0.0 {
+        Some(if t_enter >= 0.0 { t_enter } else { t_exit })
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,12 +275,12 @@ fn title_for(mode: CameraMode) -> &'static str {
         CameraMode::Orbit => concat!(
             "CoEngine v",
             env!("CARGO_PKG_VERSION"),
-            "   [Orbit]   L-drag orbit · R-drag pan · scroll zoom · C=add cube · Tab=Fly · Esc=quit"
+            "   [Orbit]   L-drag orbit · R-drag pan · scroll zoom · click=select · C=add · Del=remove · Tab=Fly · Esc=quit"
         ),
         CameraMode::Fly => concat!(
             "CoEngine v",
             env!("CARGO_PKG_VERSION"),
-            "   [Fly]   WASD move · E/Q up/down · R-drag look · C=add cube · Tab=Orbit · Esc=quit"
+            "   [Fly]   WASD move · E/Q up/down · R-drag look · click=select · C=add · Del=remove · Tab=Orbit · Esc=quit"
         ),
     }
 }
@@ -281,10 +303,11 @@ struct State {
     grid_buffer: wgpu::Buffer,
     grid_vertex_count: u32,
 
-    // The scene: cube positions, plus the GPU buffer built from them.
     cubes: Vec<Vec3>,
     cube_buffer: Option<wgpu::Buffer>,
     cube_vertex_count: u32,
+    selected: Option<usize>,
+    spawn_count: u32,
 
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -297,6 +320,8 @@ struct State {
     keys: Keys,
     mouse_left_down: bool,
     mouse_right_down: bool,
+    cursor_pos: (f32, f32),
+    left_drag_dist: f32,
     last_frame: Instant,
 }
 
@@ -398,7 +423,6 @@ impl State {
             push_constant_ranges: &[],
         });
 
-        // Shared bits for both pipelines (same shader, same camera, same depth).
         let depth_stencil = wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: true,
@@ -412,7 +436,6 @@ impl State {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        // Grid pipeline: draws lines.
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Grid Pipeline"),
             layout: Some(&pipeline_layout),
@@ -443,7 +466,6 @@ impl State {
             cache: None,
         });
 
-        // Cube pipeline: draws filled triangles.
         let cube_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Cube Pipeline"),
             layout: Some(&pipeline_layout),
@@ -463,7 +485,7 @@ impl State {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // draw all faces (winding-agnostic; depth sorts them)
+                cull_mode: None,
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
@@ -496,6 +518,8 @@ impl State {
             cubes: Vec::new(),
             cube_buffer: None,
             cube_vertex_count: 0,
+            selected: None,
+            spawn_count: 0,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -505,6 +529,8 @@ impl State {
             keys: Keys::default(),
             mouse_left_down: false,
             mouse_right_down: false,
+            cursor_pos: (0.0, 0.0),
+            left_drag_dist: 0.0,
             last_frame: Instant::now(),
         }
     }
@@ -529,27 +555,25 @@ impl State {
         );
     }
 
-    /// Add a cube to the scene at the next free slot in a tidy grid layout, then
-    /// rebuild the cube vertex buffer.
     fn add_cube(&mut self) {
-        let n = self.cubes.len();
+        // Place by a monotonic counter so removed slots don't cause overlaps.
+        let n = self.spawn_count;
         let cols = 7;
         let col = (n % cols) as f32 - 3.0;
         let row = (n / cols) as f32 - 3.0;
-        // Centered on the grid; y = 0.5 so the unit cube rests on the ground.
-        self.cubes.push(Vec3::new(col * 1.5, 0.5, row * 1.5));
+        self.cubes.push(Vec3::new(col * 1.5, CUBE_HALF, row * 1.5));
+        self.spawn_count += 1;
         self.rebuild_cubes();
         println!("Cubes in scene: {}", self.cubes.len());
     }
 
-    /// Rebuild the GPU buffer holding all cubes' geometry.
     fn rebuild_cubes(&mut self) {
         if self.cubes.is_empty() {
             self.cube_buffer = None;
             self.cube_vertex_count = 0;
             return;
         }
-        let verts = build_cube_vertices(&self.cubes);
+        let verts = build_cube_vertices(&self.cubes, self.selected);
         self.cube_vertex_count = verts.len() as u32;
         self.cube_buffer = Some(self.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -558,6 +582,54 @@ impl State {
                 usage: wgpu::BufferUsages::VERTEX,
             },
         ));
+    }
+
+    /// Turn a screen-space click into a world ray and select the nearest cube hit.
+    fn pick(&mut self, cursor: (f32, f32)) {
+        let w = self.config.width.max(1) as f32;
+        let h = self.config.height.max(1) as f32;
+
+        // Pixel -> Normalized Device Coordinates (-1..1), with Y flipped.
+        let ndc_x = (cursor.0 / w) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (cursor.1 / h) * 2.0;
+
+        // Unproject two points (near & far planes) back into world space.
+        let inv = self.current_view_proj().inverse();
+        let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        let near = near.truncate() / near.w;
+        let far = far.truncate() / far.w;
+
+        let origin = near;
+        let dir = (far - near).normalize();
+
+        // Test every cube; keep the closest hit.
+        let mut best: Option<(usize, f32)> = None;
+        for (i, c) in self.cubes.iter().enumerate() {
+            if let Some(t) = ray_aabb(origin, dir, *c, CUBE_HALF) {
+                if best.map_or(true, |(_, bt)| t < bt) {
+                    best = Some((i, t));
+                }
+            }
+        }
+
+        self.selected = best.map(|(i, _)| i);
+        self.rebuild_cubes();
+        match self.selected {
+            Some(i) => println!("Selected cube #{i}"),
+            None => println!("Selection cleared"),
+        }
+    }
+
+    fn remove_selected(&mut self) {
+        if let Some(i) = self.selected {
+            if i < self.cubes.len() {
+                self.cubes.remove(i);
+            }
+            self.selected = None;
+            self.rebuild_cubes();
+            println!("Removed cube; {} remain", self.cubes.len());
+        }
     }
 
     fn toggle_mode(&mut self) {
@@ -683,12 +755,10 @@ impl State {
 
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            // Grid (lines).
             pass.set_pipeline(&self.grid_pipeline);
             pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
             pass.draw(0..self.grid_vertex_count, 0..1);
 
-            // Cubes (triangles), if any.
             if let Some(cube_buffer) = &self.cube_buffer {
                 pass.set_pipeline(&self.cube_pipeline);
                 pass.set_vertex_buffer(0, cube_buffer.slice(..));
@@ -774,11 +844,16 @@ impl ApplicationHandler for App {
                 state.render();
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor_pos = (position.x as f32, position.y as f32);
+            }
+
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
                 if let PhysicalKey::Code(code) = key_event.physical_key {
                     let pressed = key_event.state == ElementState::Pressed;
+                    let first_press = pressed && !key_event.repeat;
                     match code {
                         KeyCode::KeyW => state.keys.forward = pressed,
                         KeyCode::KeyS => state.keys.back = pressed,
@@ -786,16 +861,11 @@ impl ApplicationHandler for App {
                         KeyCode::KeyD => state.keys.right = pressed,
                         KeyCode::KeyE | KeyCode::Space => state.keys.up = pressed,
                         KeyCode::KeyQ => state.keys.down = pressed,
-                        KeyCode::KeyC => {
-                            if pressed && !key_event.repeat {
-                                state.add_cube();
-                            }
+                        KeyCode::KeyC if first_press => state.add_cube(),
+                        KeyCode::Delete | KeyCode::Backspace if first_press => {
+                            state.remove_selected()
                         }
-                        KeyCode::Tab => {
-                            if pressed && !key_event.repeat {
-                                state.toggle_mode();
-                            }
-                        }
+                        KeyCode::Tab if first_press => state.toggle_mode(),
                         KeyCode::Escape => event_loop.exit(),
                         _ => {}
                     }
@@ -809,7 +879,19 @@ impl ApplicationHandler for App {
             } => {
                 let pressed = btn_state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => state.mouse_left_down = pressed,
+                    MouseButton::Left => {
+                        state.mouse_left_down = pressed;
+                        if pressed {
+                            // Begin a potential click; reset drag tracking.
+                            state.left_drag_dist = 0.0;
+                        } else {
+                            // Release: a small total movement counts as a click -> pick.
+                            if state.left_drag_dist < 5.0 {
+                                let cursor = state.cursor_pos;
+                                state.pick(cursor);
+                            }
+                        }
+                    }
                     MouseButton::Right => state.mouse_right_down = pressed,
                     _ => {}
                 }
@@ -844,6 +926,12 @@ impl ApplicationHandler for App {
 
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             let (dx, dy) = (dx as f32, dy as f32);
+
+            // Track how far the left button has dragged (to tell clicks from drags).
+            if state.mouse_left_down {
+                state.left_drag_dist += dx.abs() + dy.abs();
+            }
+
             match state.mode {
                 CameraMode::Orbit => {
                     if state.mouse_left_down {
