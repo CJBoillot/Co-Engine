@@ -1,6 +1,6 @@
 [package]
 name = "coengine"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 egui = "0.29"
 egui-wgpu = "0.29"
 egui-winit = "0.29"
+egui_dock = "0.14"
 glam = "0.33.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "0.3"

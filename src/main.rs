@@ -32,13 +32,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
+
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const CUBE_HALF: f32 = 0.5;
 const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.10";
+const CO_VERSION: &str = "0.0.11";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -738,12 +740,14 @@ enum Theme {
     Barbarian,
 }
 
-/// Which main editor tab is active.
-#[derive(Clone, Copy, PartialEq)]
-enum Tab {
+/// The dockable widgets/windows of the engine workspace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DockTab {
     Scene,
     Logic,
     Code,
+    AiChat,
+    Log,
 }
 
 /// Which Settings category/submenu is showing.
@@ -762,14 +766,10 @@ struct UiState {
     /// Which Settings submenu (Theme / Controls) is showing.
     settings_tab: SettingsTab,
     show_debug: bool,
-    active_tab: Tab,
     should_quit: bool,
     /// When Some, the next key press rebinds this action (Settings -> Controls).
     rebinding: Option<ControlAction>,
-    /// Right-side panel visibility (toggled from the tool row).
-    chat_open: bool,
-    log_open: bool,
-    /// One-shot requests raised by the Log panel's Undo / Redo buttons.
+    /// One-shot requests raised by the Log tab's Undo / Redo buttons.
     undo_requested: bool,
     redo_requested: bool,
 }
@@ -783,11 +783,8 @@ impl Default for UiState {
             settings_open: false,
             settings_tab: SettingsTab::Theme,
             show_debug: true,
-            active_tab: Tab::Scene,
             should_quit: false,
             rebinding: None,
-            chat_open: true,
-            log_open: true,
             undo_requested: false,
             redo_requested: false,
         }
@@ -926,8 +923,66 @@ fn barbarian_light() -> egui::Visuals {
     v
 }
 
-/// Build the whole egui UI for this frame: top bar (menu + identity + tabs), tool
-/// row, tab content, chat panel, the bottom-left controls HUD, and menu/settings.
+/// Per-tab content router for the dockable workspace.
+struct EngineTabs<'a> {
+    chat: &'a mut ChatUi,
+    scene: &'a SceneSnapshot,
+    history: &'a [HistoryEntry],
+    history_cursor: usize,
+    undo_req: &'a mut bool,
+    redo_req: &'a mut bool,
+    scene_rect_out: &'a mut Option<egui::Rect>,
+}
+
+impl TabViewer for EngineTabs<'_> {
+    type Tab = DockTab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        match tab {
+            DockTab::Scene => "3D Scene",
+            DockTab::Logic => "Logic",
+            DockTab::Code => "Code",
+            DockTab::AiChat => "AI Chat",
+            DockTab::Log => "Log",
+        }
+        .into()
+    }
+
+    /// The 3D Scene tab is transparent so the wgpu viewport renders through it.
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        !matches!(tab, DockTab::Scene)
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        match tab {
+            DockTab::Scene => {
+                // Capture the viewport rect; body stays empty so the 3D shows through.
+                *self.scene_rect_out = Some(ui.max_rect());
+            }
+            DockTab::Logic => {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("Logic — coming soon").heading().weak());
+                });
+            }
+            DockTab::Code => {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("Code — coming soon").heading().weak());
+                });
+            }
+            DockTab::AiChat => chat_tab(ui, self.chat, self.scene),
+            DockTab::Log => log_tab(
+                ui,
+                self.history,
+                self.history_cursor,
+                self.undo_req,
+                self.redo_req,
+            ),
+        }
+    }
+}
+
+/// Build the per-frame egui chrome (top bar, tool row, menu/settings, HUD) and the
+/// dockable workspace (3D Scene / Logic / Code / AI Chat / Log).
 fn build_ui(
     ctx: &egui::Context,
     ui_state: &mut UiState,
@@ -938,6 +993,8 @@ fn build_ui(
     controls: &Controls,
     history: &[HistoryEntry],
     history_cursor: usize,
+    dock_state: &mut DockState<DockTab>,
+    scene_rect_out: &mut Option<egui::Rect>,
 ) {
     // Apply the selected theme + mode (UI only — the 3D background is fixed).
     ctx.set_visuals(theme_visuals(ui_state.theme, ui_state.dark_mode));
@@ -952,10 +1009,25 @@ fn build_ui(
             ui.separator();
             ui.label(egui::RichText::new("CoEngine").strong().color(ACCENT_GOLD));
             ui.label(egui::RichText::new(format!("v{CO_VERSION}")));
-            ui.separator();
-            ui.selectable_value(&mut ui_state.active_tab, Tab::Scene, "3D Scene");
-            ui.selectable_value(&mut ui_state.active_tab, Tab::Logic, "Logic");
-            ui.selectable_value(&mut ui_state.active_tab, Tab::Code, "Code");
+
+            // Reopen buttons for any closed dock widgets.
+            let tabs = [
+                (DockTab::Scene, "3D Scene"),
+                (DockTab::Logic, "Logic"),
+                (DockTab::Code, "Code"),
+                (DockTab::AiChat, "AI Chat"),
+                (DockTab::Log, "Log"),
+            ];
+            if tabs.iter().any(|(t, _)| dock_state.find_tab(t).is_none()) {
+                ui.separator();
+                ui.label(egui::RichText::new("Open:").small());
+                for (tab, label) in tabs {
+                    if dock_state.find_tab(&tab).is_none() && ui.button(label).clicked() {
+                        dock_state.push_to_focused_leaf(tab);
+                    }
+                }
+            }
+
             // When the debug overlay is hidden, offer a way back (also bound to H).
             if !ui_state.show_debug {
                 ui.separator();
@@ -971,51 +1043,28 @@ fn build_ui(
         ui.add_space(2.0);
     });
 
-    // Tool row: panel toggles (scene tools will live here later).
+    // Tool row (scene tools will live here later).
     egui::TopBottomPanel::top("tool_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             ui.label(egui::RichText::new("Tools").small());
-            ui.separator();
-            ui.label(egui::RichText::new("Panels:").small());
-            ui.toggle_value(&mut ui_state.chat_open, "AI Chat");
-            ui.toggle_value(&mut ui_state.log_open, "Log");
         });
     });
 
-    // Right-side panels: Chat (rightmost) + Log column just to its left.
-    if ui_state.chat_open {
-        build_chat_panel(ctx, chat, scene);
-    }
-    if ui_state.log_open {
-        build_log_panel(
-            ctx,
-            history,
-            history_cursor,
-            &mut ui_state.undo_requested,
-            &mut ui_state.redo_requested,
-        );
-    }
-
-    // Tab content. The 3D Scene tab leaves the central area empty so the wgpu
-    // viewport shows through; other tabs cover it with a placeholder.
-    match ui_state.active_tab {
-        Tab::Scene => {}
-        Tab::Logic => {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Logic — coming soon").heading().weak());
-                });
-            });
-        }
-        Tab::Code => {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Code — coming soon").heading().weak());
-                });
-            });
-        }
-    }
+    // The dockable workspace fills the central area. Each tab can be dragged into a
+    // column or a full-screen tab and resized; the 3D Scene tab is the live viewport.
+    let mut viewer = EngineTabs {
+        chat,
+        scene,
+        history,
+        history_cursor,
+        undo_req: &mut ui_state.undo_requested,
+        redo_req: &mut ui_state.redo_requested,
+        scene_rect_out,
+    };
+    DockArea::new(dock_state)
+        .style(Style::from_egui(ctx.style().as_ref()))
+        .show(ctx, &mut viewer);
 
     // Bottom-left debug overlay: controls + version on a dark plate so the text is
     // readable over the 3D viewport. Hidden entirely with H (re-shown via the top bar).
@@ -1231,19 +1280,15 @@ fn build_ui(
     }
 }
 
-/// Build the Log column: the running action log + Undo / Redo for the session.
-fn build_log_panel(
-    ctx: &egui::Context,
+/// Render the Log content (action history + Undo / Redo) into a dock tab's Ui.
+fn log_tab(
+    ui: &mut egui::Ui,
     history: &[HistoryEntry],
     cursor: usize,
     undo_req: &mut bool,
     redo_req: &mut bool,
 ) {
-    egui::SidePanel::right("log_panel")
-        .resizable(true)
-        .default_width(240.0)
-        .show(ctx, |ui| {
-            egui::TopBottomPanel::top("log_header").show_inside(ui, |ui| {
+    egui::TopBottomPanel::top("log_header").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Log");
                 ui.horizontal(|ui| {
@@ -1280,16 +1325,11 @@ fn build_log_panel(
                         }
                     });
             });
-        });
 }
 
-/// Build the right-side chat panel.
-fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi, scene: &SceneSnapshot) {
-    egui::SidePanel::right("chat_panel")
-        .resizable(true)
-        .default_width(320.0)
-        .show(ctx, |ui| {
-            egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
+/// Render the AI Chat content into a dock tab's Ui.
+fn chat_tab(ui: &mut egui::Ui, chat: &mut ChatUi, scene: &SceneSnapshot) {
+    egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("AI Chat");
                 if !chat.status.is_empty() {
@@ -1392,7 +1432,6 @@ fn build_chat_panel(ctx: &egui::Context, chat: &mut ChatUi, scene: &SceneSnapsho
                         }
                     });
             });
-        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,6 +1674,17 @@ fn title_for(mode: CameraMode) -> String {
     format!("CoEngine v{CO_VERSION}   [{name}]")
 }
 
+/// Build the default dock layout: 3D Scene + Logic as main tabs, with Code,
+/// AI Chat, and Log peeled off as columns on the right.
+fn build_dock_state() -> DockState<DockTab> {
+    let mut state = DockState::new(vec![DockTab::Scene, DockTab::Logic]);
+    let surface = state.main_surface_mut();
+    let [main, aichat] = surface.split_right(NodeIndex::root(), 0.6, vec![DockTab::AiChat]);
+    let [_aichat, _log] = surface.split_right(aichat, 0.5, vec![DockTab::Log]);
+    let [_main, _code] = surface.split_right(main, 0.72, vec![DockTab::Code]);
+    state
+}
+
 // ---------------------------------------------------------------------------
 // Renderer state
 // ---------------------------------------------------------------------------
@@ -1682,6 +1732,9 @@ struct State {
     /// Session action log + undo/redo history (newest last; cursor = current state).
     history: Vec<HistoryEntry>,
     history_cursor: usize,
+    /// Dockable workspace layout + the 3D Scene tab's rect (in egui points).
+    dock_state: DockState<DockTab>,
+    scene_rect: Option<egui::Rect>,
     /// The CoE logo as an egui texture (None if assets/icon.png is missing).
     logo_texture: Option<egui::TextureHandle>,
 }
@@ -1924,6 +1977,8 @@ impl State {
                 selected: None,
             }],
             history_cursor: 0,
+            dock_state: build_dock_state(),
+            scene_rect: None,
             logo_texture,
         }
     }
@@ -1937,8 +1992,27 @@ impl State {
         }
     }
 
+    /// The 3D viewport rect in physical pixels — the Scene tab's area, or the full
+    /// window when the Scene tab isn't currently visible.
+    fn viewport_px(&self) -> (f32, f32, f32, f32) {
+        let fw = self.config.width.max(1) as f32;
+        let fh = self.config.height.max(1) as f32;
+        match self.scene_rect {
+            Some(r) => {
+                let ppp = self.window.scale_factor() as f32;
+                let x = (r.min.x * ppp).max(0.0);
+                let y = (r.min.y * ppp).max(0.0);
+                let w = (r.width() * ppp).clamp(1.0, (fw - x).max(1.0));
+                let h = (r.height() * ppp).clamp(1.0, (fh - y).max(1.0));
+                (x, y, w, h)
+            }
+            None => (0.0, 0.0, fw, fh),
+        }
+    }
+
     fn aspect(&self) -> f32 {
-        self.config.width.max(1) as f32 / self.config.height.max(1) as f32
+        let (_, _, w, h) = self.viewport_px();
+        w / h.max(1.0)
     }
 
     fn current_view_proj(&self) -> Mat4 {
@@ -1985,11 +2059,14 @@ impl State {
     }
 
     fn pick(&mut self, cursor: (f32, f32)) {
-        let w = self.config.width.max(1) as f32;
-        let h = self.config.height.max(1) as f32;
+        let (vx, vy, vw, vh) = self.viewport_px();
+        // Ignore clicks outside the 3D viewport rect.
+        if cursor.0 < vx || cursor.0 > vx + vw || cursor.1 < vy || cursor.1 > vy + vh {
+            return;
+        }
 
-        let ndc_x = (cursor.0 / w) * 2.0 - 1.0;
-        let ndc_y = 1.0 - (cursor.1 / h) * 2.0;
+        let ndc_x = ((cursor.0 - vx) / vw) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((cursor.1 - vy) / vh) * 2.0;
 
         let inv = self.current_view_proj().inverse();
         let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
@@ -2098,6 +2175,10 @@ impl State {
         if std::mem::take(&mut self.ui.redo_requested) {
             self.history_redo();
         }
+
+        // Keep the camera projection's aspect locked to the current viewport rect
+        // every frame, so resizing the window or dock never warps the 3D scene.
+        self.update_camera();
 
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -2273,6 +2354,8 @@ impl State {
         // Fixed cinematic 3D background — independent of the UI theme/mode so scene
         // creation stays visually consistent.
         let clear = wgpu::Color { r: 0.055, g: 0.070, b: 0.095, a: 1.0 };
+        // Only draw the 3D when the Scene tab is actually visible (Some rect).
+        let scene_viewport = self.scene_rect.map(|_| self.viewport_px());
 
         // --- Pass 1: the 3D scene ---
         {
@@ -2298,16 +2381,20 @@ impl State {
                 occlusion_query_set: None,
             });
 
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            if let Some((vx, vy, vw, vh)) = scene_viewport {
+                pass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
+                pass.set_scissor_rect(vx as u32, vy as u32, vw as u32, vh as u32);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            pass.set_pipeline(&self.grid_pipeline);
-            pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
-            pass.draw(0..self.grid_vertex_count, 0..1);
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
+                pass.draw(0..self.grid_vertex_count, 0..1);
 
-            if let Some(cube_buffer) = &self.cube_buffer {
-                pass.set_pipeline(&self.cube_pipeline);
-                pass.set_vertex_buffer(0, cube_buffer.slice(..));
-                pass.draw(0..self.cube_vertex_count, 0..1);
+                if let Some(cube_buffer) = &self.cube_buffer {
+                    pass.set_pipeline(&self.cube_pipeline);
+                    pass.set_vertex_buffer(0, cube_buffer.slice(..));
+                    pass.draw(0..self.cube_vertex_count, 0..1);
+                }
             }
         }
 
@@ -2325,6 +2412,8 @@ impl State {
         let controls = &self.controls;
         let history = &self.history;
         let history_cursor = self.history_cursor;
+        let dock_state = &mut self.dock_state;
+        let mut captured_scene_rect: Option<egui::Rect> = None;
         let full_output = ctx.run(raw_input, |c| {
             build_ui(
                 c,
@@ -2336,8 +2425,11 @@ impl State {
                 controls,
                 history,
                 history_cursor,
+                dock_state,
+                &mut captured_scene_rect,
             )
         });
+        self.scene_rect = captured_scene_rect;
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -2522,18 +2614,32 @@ impl ApplicationHandler for App {
             .egui_state
             .on_window_event(&state.window, &event)
             .consumed;
-        if egui_consumed {
-            return;
+
+        // Always track the cursor — 3D picking and orbit need the latest position.
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            state.cursor_pos = (position.x as f32, position.y as f32);
         }
 
-        match event {
-            WindowEvent::CursorMoved { position, .. } => {
-                state.cursor_pos = (position.x as f32, position.y as f32);
+        // The 3D viewport only reacts when the cursor is inside its rect. Dock split
+        // handles and tab bars sit outside this rect, so resizing/dragging them never
+        // moves the camera; egui keeps the mouse everywhere else.
+        let in_scene = match state.scene_rect {
+            Some(_) => {
+                let (vx, vy, vw, vh) = state.viewport_px();
+                let (cx, cy) = state.cursor_pos;
+                cx >= vx && cx <= vx + vw && cy >= vy && cy <= vy + vh
             }
+            None => false,
+        };
 
+        match event {
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
+                // Let egui keep keyboard input when it's focused (e.g. typing in chat).
+                if egui_consumed {
+                    return;
+                }
                 if let PhysicalKey::Code(code) = key_event.physical_key {
                     let pressed = key_event.state == ElementState::Pressed;
                     let first_press = pressed && !key_event.repeat;
@@ -2571,6 +2677,11 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let pressed = btn_state == ElementState::Pressed;
+                // Only START a 3D interaction when the press lands inside the viewport.
+                // Releases always run so the drag flags can't get stuck.
+                if pressed && !in_scene {
+                    return;
+                }
                 match button {
                     MouseButton::Left => {
                         state.mouse_left_down = pressed;
@@ -2587,6 +2698,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if !in_scene {
+                    return;
+                }
                 if state.mode == CameraMode::Orbit {
                     let scroll = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
