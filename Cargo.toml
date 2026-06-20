@@ -1,6 +1,6 @@
 [package]
 name = "coengine"
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
 
 [dependencies]
@@ -8,14 +8,16 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 egui = "0.29"
 egui-wgpu = "0.29"
 egui-winit = "0.29"
-egui_dock = "0.14"
-glam = "0.33.1"
+egui_dock = { version = "0.14", features = ["serde"] }
+glam = { version = "0.33.1", features = ["serde"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "0.3"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
 ureq = "2"
 wgpu = "22"
-winit = "0.30"
+winit = { version = "0.30", features = ["serde"] }
 
 [build-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }

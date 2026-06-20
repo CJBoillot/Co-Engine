@@ -16,15 +16,17 @@
 //!   Fly:   WASD move · E/Q up/down · right-drag look · click select · C add · Del remove · Tab Orbit
 //!   Esc quits.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
 };
@@ -40,7 +42,7 @@ const CUBE_BASE_COLOR: [f32; 3] = [0.85, 0.55, 0.25];
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-const CO_VERSION: &str = "0.0.11";
+const CO_VERSION: &str = "0.0.12";
 
 /// A Claude model the in-engine chat can use. `effort` marks models that accept
 /// the `output_config.effort` speed control (Haiku 4.5 does not).
@@ -98,7 +100,7 @@ impl Vertex {
 }
 
 /// A cube in the scene: a position plus a base color (shaded per-face at build).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Cube {
     pos: Vec3,
     color: [f32; 3],
@@ -734,14 +736,14 @@ fn run_agent(req: AgentRequest, tx: Sender<StreamMsg>) {
 }
 
 /// Visual theme preset for the UI (the 3D viewport is unaffected by themes).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Theme {
     DefaultSimple,
     Barbarian,
 }
 
 /// The dockable widgets/windows of the engine workspace.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum DockTab {
     Scene,
     Logic,
@@ -772,6 +774,18 @@ struct UiState {
     /// One-shot requests raised by the Log tab's Undo / Redo buttons.
     undo_requested: bool,
     redo_requested: bool,
+    /// One-shot project requests raised by the Menu (processed in `update`).
+    save_requested: bool,
+    save_as_requested: bool,
+    open_requested: bool,
+    new_requested: bool,
+    /// Startup popup ("Open last used project?") + its one-shot button requests.
+    show_startup_popup: bool,
+    open_last_requested: bool,
+    /// Display name of the last-used project (for the startup popup label).
+    last_project_name: Option<String>,
+    /// Transient status line shown in the Menu after a save/open (e.g. errors).
+    project_status: Option<String>,
 }
 
 impl Default for UiState {
@@ -787,6 +801,14 @@ impl Default for UiState {
             rebinding: None,
             undo_requested: false,
             redo_requested: false,
+            save_requested: false,
+            save_as_requested: false,
+            open_requested: false,
+            new_requested: false,
+            show_startup_popup: false,
+            open_last_requested: false,
+            last_project_name: None,
+            project_status: None,
         }
     }
 }
@@ -989,6 +1011,8 @@ fn build_ui(
     chat: &mut ChatUi,
     mode: CameraMode,
     logo: Option<&egui::TextureHandle>,
+    splash: Option<&egui::TextureHandle>,
+    loading: bool,
     scene: &SceneSnapshot,
     controls: &Controls,
     history: &[HistoryEntry],
@@ -998,6 +1022,104 @@ fn build_ui(
 ) {
     // Apply the selected theme + mode (UI only — the 3D background is fixed).
     ctx.set_visuals(theme_visuals(ui_state.theme, ui_state.dark_mode));
+
+    // Loading screen: the splash at full opacity, fit to the window at its own
+    // aspect ratio (no stretching), centered on black, until the timer elapses.
+    if loading {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                let area = ui.max_rect();
+                if let Some(tex) = splash {
+                    let img = tex.size_vec2();
+                    let ar = img.x / img.y.max(1.0);
+                    let area_ar = area.width() / area.height().max(1.0);
+                    // "Contain": largest rect with the image's aspect that fits.
+                    let size = if area_ar > ar {
+                        egui::vec2(area.height() * ar, area.height())
+                    } else {
+                        egui::vec2(area.width(), area.width() / ar)
+                    };
+                    let draw = egui::Rect::from_center_size(area.center(), size);
+                    let uv =
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(tex.id(), draw, uv, egui::Color32::WHITE);
+                    ui.painter().text(
+                        draw.center_bottom() - egui::vec2(0.0, 16.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        "Loading…",
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::from_rgb(228, 223, 209),
+                    );
+                }
+            });
+        return;
+    }
+
+    // Startup popup: offer to reopen the last-used project (or new / empty).
+    if ui_state.show_startup_popup {
+        let name = ui_state
+            .last_project_name
+            .clone()
+            .unwrap_or_else(|| "last project".to_string());
+        egui::Window::new("startup")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(300.0);
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    if let Some(tex) = logo {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(48.0, 48.0),
+                        )));
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Welcome to CoEngine")
+                            .heading()
+                            .color(ACCENT_GOLD),
+                    );
+                });
+                ui.add_space(10.0);
+                ui.label("Open last used project?");
+                ui.label(egui::RichText::new(&name).strong());
+                ui.add_space(10.0);
+
+                let bw = ui.available_width();
+                if ui
+                    .add_sized(
+                        [bw, 32.0],
+                        egui::Button::new(format!("Open  {name}"))
+                            .fill(egui::Color32::from_rgb(60, 80, 120)),
+                    )
+                    .clicked()
+                {
+                    ui_state.open_last_requested = true;
+                    ui_state.show_startup_popup = false;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("New Project…"))
+                    .clicked()
+                {
+                    ui_state.new_requested = true;
+                    ui_state.show_startup_popup = false;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("Start empty"))
+                    .clicked()
+                {
+                    ui_state.show_startup_popup = false;
+                }
+                ui.add_space(8.0);
+            });
+    }
 
     // Top bar: Menu + identity + tabs, all on one row.
     egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
@@ -1151,6 +1273,48 @@ fn build_ui(
                 ui.add_space(8.0);
 
                 let bw = ui.available_width();
+
+                // Project: New / Open / Save / Save As. These raise one-shot requests
+                // that `State::update` services (the file I/O needs the live scene).
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("New Project…"))
+                    .clicked()
+                {
+                    ui_state.new_requested = true;
+                    ui_state.menu_open = false;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("Open Project…"))
+                    .clicked()
+                {
+                    ui_state.open_requested = true;
+                    ui_state.menu_open = false;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("Save Project"))
+                    .clicked()
+                {
+                    ui_state.save_requested = true;
+                    ui_state.menu_open = false;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("Save Project As…"))
+                    .clicked()
+                {
+                    ui_state.save_as_requested = true;
+                    ui_state.menu_open = false;
+                }
+                if let Some(status) = &ui_state.project_status {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(status).small().italics());
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
                 if ui
                     .add_sized([bw, 34.0], egui::Button::new("Settings"))
                     .clicked()
@@ -1564,7 +1728,7 @@ const CONTROL_ACTIONS: &[(ControlAction, &str)] = &[
 ];
 
 /// The current key bound to each action. Remappable in Settings -> Controls.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Controls {
     forward: KeyCode,
     back: KeyCode,
@@ -1674,9 +1838,98 @@ fn title_for(mode: CameraMode) -> String {
     format!("CoEngine v{CO_VERSION}   [{name}]")
 }
 
-/// Build the default dock layout: 3D Scene + Logic as main tabs, with Code,
-/// AI Chat, and Log peeled off as columns on the right.
+/// On-disk project manifest (`project.json`). One file per project folder; holds
+/// the whole reproducible state of a project: the scene plus the settings that
+/// belong to *this* project (see memory: v0.0.12 settings model). The same shape
+/// also backs the global "last settings" store — fields a fresh project seeds
+/// from are exactly the non-scene ones.
+///
+/// `format_version` lets later versions migrate old files instead of failing to
+/// load. Window geometry is stored as plain numbers (not winit types) so the
+/// JSON stays human-readable and decoupled from the windowing crate.
+#[derive(Serialize, Deserialize)]
+struct Project {
+    /// Manifest schema version; bump when the format changes incompatibly.
+    format_version: u32,
+    /// The CoEngine (CoSemVer) build that last wrote this file — for diagnostics.
+    engine_version: String,
+    /// The 3D scene: every placed cube.
+    scene: Vec<Cube>,
+    /// UI theme preset.
+    theme: Theme,
+    /// Dark vs. light mode for the chosen theme.
+    dark_mode: bool,
+    /// Remappable control bindings (keymap).
+    controls: Controls,
+    /// Dockable workspace layout.
+    dock_state: DockState<DockTab>,
+    /// Last window inner size in physical pixels, if known.
+    window_size: Option<(u32, u32)>,
+    /// Last window position (top-left, physical pixels), if known.
+    window_pos: Option<(i32, i32)>,
+}
+
+/// Current `project.json` schema version.
+const PROJECT_FORMAT_VERSION: u32 = 1;
+
+/// Global, cross-project config (the "last settings" store, see v0.0.12 settings
+/// model): remembers the most-recently-used project and the settings new/empty
+/// sessions seed from. Lives at `%APPDATA%\CoEngine\config.json`.
+#[derive(Serialize, Deserialize, Default)]
+struct GlobalConfig {
+    /// Folder of the most recently saved/opened project (for the startup popup).
+    last_project: Option<PathBuf>,
+    /// Last-used UI theme (seeds new/empty sessions).
+    theme: Option<Theme>,
+    /// Last-used dark/light mode.
+    dark_mode: Option<bool>,
+    /// Last-used control bindings.
+    controls: Option<Controls>,
+}
+
+/// Path to the global config file, creating `%APPDATA%\CoEngine\` if needed.
+fn global_config_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let dir = PathBuf::from(appdata).join("CoEngine");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("config.json"))
+}
+
+/// Load the global config (defaults if missing or unreadable).
+fn load_global_config() -> GlobalConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Write the global config, ignoring errors (it's a convenience store).
+fn save_global_config(cfg: &GlobalConfig) {
+    if let Some(p) = global_config_path() {
+        if let Ok(json) = serde_json::to_string_pretty(cfg) {
+            let _ = std::fs::write(p, json);
+        }
+    }
+}
+
+/// The default no-project layout, captured from a hand-arranged session
+/// (assets/default_layout.json) and baked into the binary. Used on a fresh
+/// launch and for "Start empty". Stale rects are recomputed by egui_dock from
+/// the stored split fractions on the first layout pass.
+const DEFAULT_LAYOUT_JSON: &str = include_str!("../assets/default_layout.json");
+
+/// Build the default dock layout: deserialize the baked-in arranged layout,
+/// falling back to the programmatic layout if it ever fails to parse.
 fn build_dock_state() -> DockState<DockTab> {
+    serde_json::from_str(DEFAULT_LAYOUT_JSON).unwrap_or_else(|e| {
+        eprintln!("default_layout.json failed to parse ({e}); using fallback layout");
+        fallback_dock_state()
+    })
+}
+
+/// Programmatic fallback: 3D Scene + Logic as main tabs, with Code, AI Chat,
+/// and Log peeled off as columns on the right.
+fn fallback_dock_state() -> DockState<DockTab> {
     let mut state = DockState::new(vec![DockTab::Scene, DockTab::Logic]);
     let surface = state.main_surface_mut();
     let [main, aichat] = surface.split_right(NodeIndex::root(), 0.6, vec![DockTab::AiChat]);
@@ -1737,6 +1990,19 @@ struct State {
     scene_rect: Option<egui::Rect>,
     /// The CoE logo as an egui texture (None if assets/icon.png is missing).
     logo_texture: Option<egui::TextureHandle>,
+    /// The blueprint splash art (assets/splash.png) — loading screen + bg.
+    splash_texture: Option<egui::TextureHandle>,
+    /// While Some and still in the future, a full-screen loading splash is shown
+    /// (set at startup and whenever a project loads). Cleared once it elapses.
+    loading_until: Option<Instant>,
+    /// True until the *startup* splash finishes — then the window resizes from
+    /// the splash size to the working size. Project-load splashes don't resize.
+    startup_splash: bool,
+    /// The folder of the currently open project (`project.json` lives inside).
+    /// `None` until the scene is saved or a project is opened.
+    project_path: Option<PathBuf>,
+    /// The last-used project folder from the global config (for "Open last").
+    startup_last_project: Option<PathBuf>,
 }
 
 impl State {
@@ -1934,6 +2200,33 @@ impl State {
             egui_ctx.load_texture("coengine_logo", image, egui::TextureOptions::LINEAR)
         });
 
+        let splash_texture = load_splash_rgba().map(|(rgba, w, h)| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            egui_ctx.load_texture("coengine_splash", image, egui::TextureOptions::LINEAR)
+        });
+
+        // Seed this session from the global "last settings", and remember the
+        // last-used project for the startup popup (only if it still exists).
+        let cfg = load_global_config();
+        let controls = cfg.controls.unwrap_or_default();
+        let mut ui = UiState::default();
+        if let Some(t) = cfg.theme {
+            ui.theme = t;
+        }
+        if let Some(d) = cfg.dark_mode {
+            ui.dark_mode = d;
+        }
+        let startup_last_project = cfg
+            .last_project
+            .filter(|p| p.join("project.json").is_file());
+        if let Some(p) = &startup_last_project {
+            ui.show_startup_popup = true;
+            ui.last_project_name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .or_else(|| Some(p.display().to_string()));
+        }
+
         State {
             window,
             surface,
@@ -1956,7 +2249,7 @@ impl State {
             fly,
             mode,
             keys: Keys::default(),
-            controls: Controls::default(),
+            controls,
             mouse_left_down: false,
             mouse_right_down: false,
             cursor_pos: (0.0, 0.0),
@@ -1970,7 +2263,7 @@ impl State {
                 effort_idx: DEFAULT_EFFORT_IDX,
                 ..Default::default()
             },
-            ui: UiState::default(),
+            ui,
             history: vec![HistoryEntry {
                 label: "Session start".to_string(),
                 cubes: Vec::new(),
@@ -1980,6 +2273,12 @@ impl State {
             dock_state: build_dock_state(),
             scene_rect: None,
             logo_texture,
+            splash_texture,
+            // Show the splash for a moment while the first frames warm up.
+            loading_until: Some(Instant::now() + Duration::from_millis(1400)),
+            startup_splash: true,
+            project_path: None,
+            startup_last_project,
         }
     }
 
@@ -2144,6 +2443,183 @@ impl State {
         self.rebuild_cubes();
     }
 
+    // ---- Project persistence (v0.0.12) -------------------------------------
+
+    /// Snapshot the whole project (scene + per-project settings + layout +
+    /// window geometry) into the on-disk manifest shape.
+    fn gather_project(&self) -> Project {
+        Project {
+            format_version: PROJECT_FORMAT_VERSION,
+            engine_version: CO_VERSION.to_string(),
+            scene: self.cubes.clone(),
+            theme: self.ui.theme,
+            dark_mode: self.ui.dark_mode,
+            controls: self.controls,
+            dock_state: self.dock_state.clone(),
+            window_size: Some((self.config.width, self.config.height)),
+            window_pos: self
+                .window
+                .outer_position()
+                .ok()
+                .map(|p| (p.x, p.y)),
+        }
+    }
+
+    /// Replace the live engine state with a loaded project, rebuilding GPU
+    /// buffers and resetting the undo history to the loaded scene as baseline.
+    fn apply_project(&mut self, p: Project) {
+        self.cubes = p.scene;
+        self.selected = None;
+        self.rebuild_cubes();
+
+        self.ui.theme = p.theme;
+        self.ui.dark_mode = p.dark_mode;
+        self.controls = p.controls;
+        self.dock_state = p.dock_state;
+
+        // The loaded scene becomes the new history baseline (undo can't go past it).
+        self.history = vec![HistoryEntry {
+            label: "Opened project".to_string(),
+            cubes: self.cubes.clone(),
+            selected: None,
+        }];
+        self.history_cursor = 0;
+
+        // Briefly show the loading splash while the loaded project settles in.
+        self.loading_until = Some(Instant::now() + Duration::from_millis(700));
+
+        // Restore window geometry. Resizing triggers the normal resize path which
+        // reconfigures the surface; the camera aspect re-syncs each frame.
+        if let Some((w, h)) = p.window_size {
+            let _ = self.window.request_inner_size(PhysicalSize::new(w, h));
+        }
+        if let Some((x, y)) = p.window_pos {
+            self.window.set_outer_position(PhysicalPosition::new(x, y));
+        }
+    }
+
+    /// Write `project.json` into the given project folder.
+    fn write_project(&self, dir: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(&self.gather_project())
+            .map_err(std::io::Error::other)?;
+        std::fs::write(dir.join("project.json"), json)
+    }
+
+    /// Save to the current project folder, or fall back to "Save As" if none yet.
+    fn save_project(&mut self) {
+        match self.project_path.clone() {
+            Some(dir) => self.save_into(&dir),
+            None => self.save_project_as(),
+        }
+    }
+
+    /// Prompt for a folder, then save the project there and adopt it as current.
+    fn save_project_as(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose a folder for this CoEngine project")
+            .pick_folder()
+        {
+            self.save_into(&dir);
+        }
+    }
+
+    /// Shared save body: write the manifest, adopt the folder, report status.
+    fn save_into(&mut self, dir: &Path) {
+        match self.write_project(dir) {
+            Ok(()) => {
+                self.project_path = Some(dir.to_path_buf());
+                self.ui.project_status = Some(format!("Saved to {}", dir.display()));
+                println!("Saved project to {}", dir.display());
+                self.update_global_config();
+            }
+            Err(e) => {
+                self.ui.project_status = Some(format!("Save failed: {e}"));
+                eprintln!("Save failed: {e}");
+            }
+        }
+    }
+
+    /// Prompt for a project folder, then open its `project.json`.
+    fn open_project(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Open a CoEngine project folder")
+            .pick_folder()
+        {
+            self.open_project_at(&dir);
+        }
+    }
+
+    /// Load the `project.json` in a known folder (used by Open and the startup
+    /// "Open last" button — no file dialog).
+    fn open_project_at(&mut self, dir: &Path) {
+        let manifest = dir.join("project.json");
+        let text = match std::fs::read_to_string(&manifest) {
+            Ok(t) => t,
+            Err(e) => {
+                self.ui.project_status = Some(format!("No project.json here: {e}"));
+                eprintln!("Open failed: {e}");
+                return;
+            }
+        };
+        match serde_json::from_str::<Project>(&text) {
+            Ok(p) => {
+                if p.format_version != PROJECT_FORMAT_VERSION {
+                    self.ui.project_status = Some(format!(
+                        "Unsupported project format v{} (this build expects v{PROJECT_FORMAT_VERSION})",
+                        p.format_version
+                    ));
+                    return;
+                }
+                self.apply_project(p);
+                self.project_path = Some(dir.to_path_buf());
+                self.ui.project_status = Some(format!("Opened {}", dir.display()));
+                println!("Opened project {}", dir.display());
+                self.update_global_config();
+            }
+            Err(e) => {
+                self.ui.project_status = Some(format!("Couldn't parse project.json: {e}"));
+                eprintln!("Parse failed: {e}");
+            }
+        }
+    }
+
+    /// Start a new, empty project: pick a folder, reset to the default layout +
+    /// empty scene (keeping the seeded settings), then save it there.
+    fn new_project(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose a folder for the new CoEngine project")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.cubes.clear();
+        self.selected = None;
+        self.rebuild_cubes();
+        self.dock_state = build_dock_state();
+        self.history = vec![HistoryEntry {
+            label: "New project".to_string(),
+            cubes: Vec::new(),
+            selected: None,
+        }];
+        self.history_cursor = 0;
+        self.loading_until = Some(Instant::now() + Duration::from_millis(700));
+        self.save_into(&dir);
+    }
+
+    /// Persist the global "last settings" + last project to `%APPDATA%`. Keeps
+    /// the prior last-project if none was opened/saved this session.
+    fn update_global_config(&self) {
+        save_global_config(&GlobalConfig {
+            last_project: self
+                .project_path
+                .clone()
+                .or_else(|| self.startup_last_project.clone()),
+            theme: Some(self.ui.theme),
+            dark_mode: Some(self.ui.dark_mode),
+            controls: Some(self.controls),
+        });
+    }
+
     fn toggle_mode(&mut self) {
         match self.mode {
             CameraMode::Orbit => {
@@ -2174,6 +2650,38 @@ impl State {
         }
         if std::mem::take(&mut self.ui.redo_requested) {
             self.history_redo();
+        }
+
+        // Clear the loading splash once its timer elapses. The first (startup)
+        // splash then grows the window from the splash size to the working size.
+        if let Some(t) = self.loading_until {
+            if Instant::now() >= t {
+                self.loading_until = None;
+                if self.startup_splash {
+                    self.startup_splash = false;
+                    let _ = self.window.request_inner_size(LogicalSize::new(1280.0, 720.0));
+                }
+            }
+        }
+
+        // Project Open / Save / Save As / New requested from the Menu or the
+        // startup popup last frame.
+        if std::mem::take(&mut self.ui.open_requested) {
+            self.open_project();
+        }
+        if std::mem::take(&mut self.ui.open_last_requested) {
+            if let Some(dir) = self.startup_last_project.clone() {
+                self.open_project_at(&dir);
+            }
+        }
+        if std::mem::take(&mut self.ui.new_requested) {
+            self.new_project();
+        }
+        if std::mem::take(&mut self.ui.save_requested) {
+            self.save_project();
+        }
+        if std::mem::take(&mut self.ui.save_as_requested) {
+            self.save_project_as();
         }
 
         // Keep the camera projection's aspect locked to the current viewport rect
@@ -2403,6 +2911,8 @@ impl State {
         let ctx = self.egui_ctx.clone();
         let mode = self.mode;
         let logo = self.logo_texture.as_ref();
+        let splash = self.splash_texture.as_ref();
+        let loading = self.loading_until.is_some();
         let scene = SceneSnapshot {
             cubes: self.cubes.iter().map(|c| (c.pos, c.color)).collect(),
             selected: self.selected,
@@ -2421,6 +2931,8 @@ impl State {
                 chat,
                 mode,
                 logo,
+                splash,
+                loading,
                 &scene,
                 controls,
                 history,
@@ -2479,7 +2991,18 @@ impl State {
 /// Load the engine logo from `assets/icon.png` as RGBA8 bytes + dimensions.
 /// Returns None if the file is missing or can't be decoded (the app still runs).
 fn load_logo_rgba() -> Option<(Vec<u8>, u32, u32)> {
-    let bytes = std::fs::read("assets/icon.png").ok()?;
+    load_png_rgba("assets/icon.png")
+}
+
+/// Load the blueprint splash art from `assets/splash.png` (loading screen +
+/// 50%-opacity empty-area background). None if missing — the app still runs.
+fn load_splash_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    load_png_rgba("assets/splash.png")
+}
+
+/// Decode a PNG on disk to RGBA8 bytes + dimensions.
+fn load_png_rgba(path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    let bytes = std::fs::read(path).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -2525,9 +3048,11 @@ impl ApplicationHandler for App {
         // Load the logo (assets/icon.png) for the window icon + the in-UI overlay.
         let logo = load_logo_rgba();
 
+        // Open at the splash art's 4:3 size so the startup splash shows undistorted;
+        // State resizes the window to the working size once loading finishes.
         let mut attributes = Window::default_attributes()
             .with_title(title_for(CameraMode::Orbit))
-            .with_inner_size(LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(LogicalSize::new(900.0, 675.0));
 
         if let Some((rgba, w, h)) = &logo {
             if let Ok(icon) = winit::window::Icon::from_rgba(rgba.clone(), *w, *h) {
@@ -2757,6 +3282,14 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &self.state {
             state.window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Persist the global "last settings" + last project on quit, so the next
+        // launch can seed settings and offer to reopen the project.
+        if let Some(state) = &self.state {
+            state.update_global_config();
         }
     }
 }

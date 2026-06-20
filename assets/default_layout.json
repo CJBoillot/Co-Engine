@@ -1,0 +1,78 @@
+{
+  "surfaces": [
+    {
+      "Main": {
+        "nodes": [
+          {
+            "Horizontal": {
+              "rect": { "min": { "x": 0.0, "y": 51.0 }, "max": { "x": 1280.0, "y": 720.0 } },
+              "fraction": 0.79265684
+            }
+          },
+          {
+            "Horizontal": {
+              "rect": { "min": { "x": 0.0, "y": 51.0 }, "max": { "x": 1014.4, "y": 720.0 } },
+              "fraction": 0.2789824
+            }
+          },
+          {
+            "Leaf": {
+              "rect": { "min": { "x": 1015.2, "y": 51.0 }, "max": { "x": 1280.0, "y": 720.0 } },
+              "viewport": { "min": { "x": 1015.2, "y": 75.0 }, "max": { "x": 1280.0, "y": 720.0 } },
+              "tabs": ["AiChat", "Log"],
+              "active": 0,
+              "scroll": 0.0
+            }
+          },
+          {
+            "Leaf": {
+              "rect": { "min": { "x": 0.0, "y": 51.0 }, "max": { "x": 282.4, "y": 720.0 } },
+              "viewport": { "min": { "x": 0.0, "y": 75.0 }, "max": { "x": 282.4, "y": 720.0 } },
+              "tabs": ["Code"],
+              "active": 0,
+              "scroll": 0.0
+            }
+          },
+          {
+            "Vertical": {
+              "rect": { "min": { "x": 283.2, "y": 51.0 }, "max": { "x": 1014.4, "y": 720.0 } },
+              "fraction": 0.30104625
+            }
+          },
+          "Empty",
+          "Empty",
+          "Empty",
+          "Empty",
+          {
+            "Leaf": {
+              "rect": { "min": { "x": 283.2, "y": 51.0 }, "max": { "x": 1014.4, "y": 251.2 } },
+              "viewport": { "min": { "x": 283.2, "y": 75.00001 }, "max": { "x": 1014.4, "y": 251.20001 } },
+              "tabs": ["Logic"],
+              "active": 0,
+              "scroll": 0.0
+            }
+          },
+          {
+            "Leaf": {
+              "rect": { "min": { "x": 283.2, "y": 252.8 }, "max": { "x": 1014.4, "y": 720.0 } },
+              "viewport": { "min": { "x": 283.2, "y": 276.8 }, "max": { "x": 1014.4, "y": 720.0 } },
+              "tabs": ["Scene"],
+              "active": 0,
+              "scroll": 0.0
+            }
+          },
+          "Empty",
+          "Empty",
+          "Empty",
+          "Empty"
+        ],
+        "focused_node": 2
+      }
+    }
+  ],
+  "focused_surface": 0,
+  "translations": {
+    "tab_context_menu": { "close_button": "Close", "eject_button": "Eject" },
+    "window": { "close_button_tooltip": "This window contains non-closable tabs." }
+  }
+}
