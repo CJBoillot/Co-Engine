@@ -1,22 +1,23 @@
-//! CoEngine — Milestone 1, Step 5: "Chat Panel + Version Watermark"
+//! CoEngine — Milestone 1, Step 6: "Chat Wired to Claude"
 //!
-//! Builds on Step 4 (select & remove). New in this step:
-//!   * **egui** is integrated as an on-screen UI layer drawn over the 3D scene,
-//!   * a **chat panel** docked on the right: a scrolling message history plus a
-//!     text box + Send/Clear. For now it **echoes locally** (no network) — it is
-//!     wired to Claude in Step 6,
-//!   * the **bottom-left version watermark** ("CoEngine v0.0.5"), read from the
-//!     crate version.
+//! Builds on Step 5 (egui chat panel, local echo). New in this step:
+//!   * the chat now talks to **Claude** (`claude-opus-4-8`) via the Anthropic
+//!     Messages API, with the reply **streamed** in token-by-token,
+//!   * the request runs on a **background thread** so the 3D app never freezes;
+//!     streamed text is delivered to the UI over a channel and appended each frame,
+//!   * the API key is read once from the **`ANTHROPIC_API_KEY`** environment
+//!     variable — never stored in the repo. If it's unset, the chat says so.
 //!
-//! egui captures input over its own panels, so clicking/typing in the chat does
-//! not move the camera or spawn cubes.
+//! Versioning uses CoSemVer: `CO_VERSION` drives the on-screen version; a trailing
+//! letter (e.g. 0.0.6b) marks a bug fix (Cargo.toml keeps the numeric base).
 //!
-//! Controls (when not interacting with the chat):
+//! Controls (when not typing in the chat):
 //!   Orbit: left-drag orbit · right-drag pan · scroll zoom · click select · C add · Del remove · Tab Fly
 //!   Fly:   WASD move · E/Q up/down · right-drag look · click select · C add · Del remove · Tab Orbit
 //!   Esc quits.
 
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
@@ -33,7 +34,13 @@ use winit::window::{Window, WindowId};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const CUBE_HALF: f32 = 0.5;
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
+/// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
+const CO_VERSION: &str = "0.0.6";
+
+/// The Claude model the chat panel talks to.
+const CLAUDE_MODEL: &str = "claude-opus-4-8";
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -158,49 +165,192 @@ fn ray_aabb(origin: Vec3, dir: Vec3, center: Vec3, half: f32) -> Option<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Chat (UI state)
+// Chat (UI state + Claude streaming)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    User,
+    Assistant,
+}
+
+impl Role {
+    fn label(self) -> &'static str {
+        match self {
+            Role::User => "You",
+            Role::Assistant => "Claude",
+        }
+    }
+    fn api(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+}
+
 struct ChatMessage {
-    role: String,
+    role: Role,
     text: String,
+}
+
+/// Messages sent from the streaming worker thread back to the UI.
+enum StreamMsg {
+    Delta(String),
+    Done,
+    Error(String),
 }
 
 #[derive(Default)]
 struct ChatUi {
     messages: Vec<ChatMessage>,
     input: String,
+    /// Receiver for the in-flight reply (None when idle).
+    rx: Option<Receiver<StreamMsg>>,
+    /// Index of the assistant message currently being streamed into.
+    streaming_index: Option<usize>,
+    /// A short status/error line shown under the header.
+    status: String,
 }
 
-/// Local-echo send (Step 5). Step 6 replaces the stub reply with a real Claude call.
+/// Send the current input to Claude (real, streaming). Ignored if a reply is
+/// already in flight or the input is empty.
 fn send_message(chat: &mut ChatUi) {
+    if chat.rx.is_some() {
+        return; // a reply is already streaming
+    }
     let text = chat.input.trim().to_string();
-    chat.input.clear();
     if text.is_empty() {
         return;
     }
-    chat.messages.push(ChatMessage { role: "You".to_string(), text: text.clone() });
-    chat.messages.push(ChatMessage {
-        role: "Claude (stub)".to_string(),
-        text: format!("(local echo) {text}"),
+    chat.input.clear();
+
+    // Read the API key from the environment (never stored in the repo).
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => {
+            chat.messages.push(ChatMessage { role: Role::User, text });
+            chat.messages.push(ChatMessage {
+                role: Role::Assistant,
+                text: "ANTHROPIC_API_KEY is not set. In a terminal run:\n  setx ANTHROPIC_API_KEY \"sk-ant-...\"\nthen restart the app."
+                    .to_string(),
+            });
+            chat.status = "API key not set".to_string();
+            return;
+        }
+    };
+
+    // Record the user's message.
+    chat.messages.push(ChatMessage { role: Role::User, text });
+
+    // Build the API conversation from everything so far.
+    let api_messages: Vec<serde_json::Value> = chat
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role.api(), "content": m.text }))
+        .collect();
+
+    // Create the empty assistant message the stream will fill in.
+    chat.messages.push(ChatMessage { role: Role::Assistant, text: String::new() });
+    chat.streaming_index = Some(chat.messages.len() - 1);
+    chat.status = "Claude is replying…".to_string();
+
+    // Do the blocking, streaming HTTP request off the UI thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+    chat.rx = Some(rx);
+    std::thread::spawn(move || stream_claude(api_key, api_messages, tx));
+}
+
+/// Worker thread: POST to the Anthropic Messages API and stream the reply,
+/// forwarding text deltas to the UI over `tx`.
+fn stream_claude(api_key: String, messages: Vec<serde_json::Value>, tx: Sender<StreamMsg>) {
+    let body = serde_json::json!({
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": messages,
     });
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+
+    let response = ureq::post("https://api.anthropic.com/v1/messages")
+        .set("x-api-key", &api_key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_string(&body_str);
+
+    let response = match response {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            let _ = tx.send(StreamMsg::Error(format!("HTTP {code}: {detail}")));
+            return;
+        }
+        Err(e) => {
+            let _ = tx.send(StreamMsg::Error(format!("request failed: {e}")));
+            return;
+        }
+    };
+
+    // The response is Server-Sent Events: lines like `data: {json}`.
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(response.into_reader());
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_delta") => {
+                if let Some(t) = v
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    let _ = tx.send(StreamMsg::Delta(t.to_string()));
+                }
+            }
+            Some("message_stop") => {
+                let _ = tx.send(StreamMsg::Done);
+                return;
+            }
+            Some("error") => {
+                let msg = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                let _ = tx.send(StreamMsg::Error(msg.to_string()));
+                return;
+            }
+            _ => {}
+        }
+    }
+    let _ = tx.send(StreamMsg::Done);
 }
 
 /// Build the egui UI for this frame: bottom-left watermark + right-side chat panel.
 fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
-    // Version watermark, anchored to the bottom-left, non-interactive.
     egui::Area::new(egui::Id::new("version_watermark"))
         .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -8.0))
         .interactable(false)
         .show(ctx, |ui| {
             ui.label(
-                egui::RichText::new(format!("CoEngine v{VERSION}"))
+                egui::RichText::new(format!("CoEngine v{CO_VERSION}"))
                     .monospace()
                     .color(egui::Color32::from_white_alpha(150)),
             );
         });
 
-    // Chat panel docked on the right edge.
     egui::SidePanel::right("chat_panel")
         .resizable(true)
         .default_width(320.0)
@@ -209,24 +359,29 @@ fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
                 ui.add_space(6.0);
                 ui.heading("Chat");
                 ui.label(
-                    egui::RichText::new("Local echo — wired to Claude in Step 6")
+                    egui::RichText::new(format!("Claude · {CLAUDE_MODEL}"))
                         .weak()
                         .small(),
                 );
+                if !chat.status.is_empty() {
+                    ui.label(egui::RichText::new(&chat.status).small().italics());
+                }
                 ui.add_space(4.0);
             });
 
             egui::TopBottomPanel::bottom("chat_input").show_inside(ui, |ui| {
                 ui.add_space(6.0);
-                let resp = ui.add(
+                let streaming = chat.rx.is_some();
+                let resp = ui.add_enabled(
+                    !streaming,
                     egui::TextEdit::singleline(&mut chat.input)
-                        .hint_text("Type a message…")
+                        .hint_text("Message Claude…")
                         .desired_width(f32::INFINITY),
                 );
                 let enter_pressed =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
-                    let send_clicked = ui.button("Send").clicked();
+                    let send_clicked = ui.add_enabled(!streaming, egui::Button::new("Send")).clicked();
                     if ui.button("Clear").clicked() {
                         chat.messages.clear();
                     }
@@ -244,7 +399,7 @@ fn build_chat_ui(ctx: &egui::Context, chat: &mut ChatUi) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         for m in &chat.messages {
-                            ui.label(egui::RichText::new(format!("{}:", m.role)).strong());
+                            ui.label(egui::RichText::new(format!("{}:", m.role.label())).strong());
                             ui.label(&m.text);
                             ui.add_space(6.0);
                         }
@@ -365,19 +520,18 @@ impl CameraUniform {
     }
 }
 
-fn title_for(mode: CameraMode) -> &'static str {
-    match mode {
-        CameraMode::Orbit => concat!(
-            "CoEngine v",
-            env!("CARGO_PKG_VERSION"),
-            "   [Orbit]   drag orbit · R-drag pan · scroll zoom · click=select · C=add · Del=remove · Tab=Fly"
+fn title_for(mode: CameraMode) -> String {
+    let (name, controls) = match mode {
+        CameraMode::Orbit => (
+            "Orbit",
+            "drag orbit · R-drag pan · scroll zoom · click=select · C=add · Del=remove · Tab=Fly",
         ),
-        CameraMode::Fly => concat!(
-            "CoEngine v",
-            env!("CARGO_PKG_VERSION"),
-            "   [Fly]   WASD · E/Q up/down · R-drag look · click=select · C=add · Del=remove · Tab=Orbit"
+        CameraMode::Fly => (
+            "Fly",
+            "WASD · E/Q up/down · R-drag look · click=select · C=add · Del=remove · Tab=Orbit",
         ),
-    }
+    };
+    format!("CoEngine v{CO_VERSION}   [{name}]   {controls}")
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +573,6 @@ struct State {
     left_drag_dist: f32,
     last_frame: Instant,
 
-    // egui (UI layer).
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -605,7 +758,6 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        // egui setup.
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -763,7 +915,7 @@ impl State {
                 self.mode = CameraMode::Orbit;
             }
         }
-        self.window.set_title(title_for(self.mode));
+        self.window.set_title(&title_for(self.mode));
         self.update_camera();
     }
 
@@ -772,6 +924,7 @@ impl State {
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
 
+        // Fly-camera movement.
         if self.mode == CameraMode::Fly {
             let f = self.fly.forward();
             let right = f.cross(Vec3::Y).normalize_or_zero();
@@ -799,6 +952,55 @@ impl State {
             if v.length_squared() > 0.0 {
                 self.fly.position += v.normalize() * self.fly.speed * dt;
                 self.update_camera();
+            }
+        }
+
+        // Drain any streamed chat tokens that arrived since last frame.
+        let mut deltas: Vec<String> = Vec::new();
+        let mut done = false;
+        let mut error: Option<String> = None;
+        if let Some(rx) = &self.chat.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(StreamMsg::Delta(t)) => deltas.push(t),
+                    Ok(StreamMsg::Done) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(StreamMsg::Error(e)) => {
+                        error = Some(e);
+                        done = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !deltas.is_empty() || done {
+            if let Some(idx) = self.chat.streaming_index {
+                if let Some(msg) = self.chat.messages.get_mut(idx) {
+                    for d in &deltas {
+                        msg.text.push_str(d);
+                    }
+                    if let Some(e) = &error {
+                        let note = format!("[error] {e}");
+                        if msg.text.is_empty() {
+                            msg.text = note;
+                        } else {
+                            msg.text.push('\n');
+                            msg.text.push_str(&note);
+                        }
+                    }
+                }
+            }
+            if done {
+                self.chat.rx = None;
+                self.chat.streaming_index = None;
+                self.chat.status.clear();
             }
         }
     }
@@ -837,7 +1039,7 @@ impl State {
                 label: Some("CoEngine Command Encoder"),
             });
 
-        // --- Pass 1: the 3D scene (grid + cubes) ---
+        // --- Pass 1: the 3D scene ---
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
@@ -879,7 +1081,7 @@ impl State {
             }
         }
 
-        // --- egui: run the UI, then draw it over the scene (Pass 2) ---
+        // --- egui UI over the scene ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
         let chat = &mut self.chat;
@@ -908,7 +1110,7 @@ impl State {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // keep the scene underneath
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -916,7 +1118,6 @@ impl State {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // egui-wgpu wants a 'static render pass.
             let mut pass = pass.forget_lifetime();
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen);
         }
@@ -994,7 +1195,6 @@ impl ApplicationHandler for App {
             return;
         };
 
-        // Window-management events: always handled.
         match &event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -1012,9 +1212,7 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
-        // Tab toggles the camera mode. Handle it ourselves and swallow it so egui
-        // does NOT use Tab to move keyboard focus into the chat box (which would
-        // make WASD type into the chat instead of flying the camera).
+        // Tab toggles camera mode; swallow it so egui can't focus the chat with it.
         if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
             if ke.physical_key == PhysicalKey::Code(KeyCode::Tab) {
                 if ke.state == ElementState::Pressed && !ke.repeat {
@@ -1024,7 +1222,6 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Let egui consume input over its panels (typing, clicking Send, etc.).
         let egui_consumed = state
             .egui_state
             .on_window_event(&state.window, &event)
@@ -1033,7 +1230,6 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Input that drives the 3D viewport.
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor_pos = (position.x as f32, position.y as f32);
@@ -1056,7 +1252,6 @@ impl ApplicationHandler for App {
                         KeyCode::Delete | KeyCode::Backspace if first_press => {
                             state.remove_selected()
                         }
-                        // Tab is handled earlier (before egui) — see window_event top.
                         KeyCode::Escape => event_loop.exit(),
                         _ => {}
                     }
