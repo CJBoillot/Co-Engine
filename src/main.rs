@@ -1,13 +1,12 @@
-//! CoEngine — Milestone 1, Step 1: "3D Grid Plane"
+//! CoEngine — Milestone 1, Step 2a: "Orbit Camera"
 //!
-//! Builds on Step 0 (window + clear). New in this step:
-//!   * a **camera** (view + perspective matrices) that maps 3D -> screen,
-//!   * a **depth buffer** so nearer geometry correctly hides farther geometry,
-//!   * **geometry**: a grid of lines on the ground (the XZ plane, y = 0),
-//!   * a **shader** (`grid.wgsl`) that positions and colors each vertex.
+//! Builds on Step 1 (static 3D grid). New in this step: an **orbit camera** you
+//! can drive with the mouse, like a 3D editor's viewport camera:
+//!   * Left-drag  -> orbit around the focus point
+//!   * Right-drag -> pan (slide the focus point)
+//!   * Scroll     -> zoom in / out
 //!
-//! The result is a 3D grid receding into the distance, with a red X axis and a
-//! blue Z axis so orientation is clear.
+//! Step 2b will add a free-fly (WASD + mouse) camera and a key to toggle modes.
 
 use std::sync::Arc;
 
@@ -16,7 +15,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -28,7 +27,6 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 // ---------------------------------------------------------------------------
 
 /// One point of geometry sent to the GPU: a 3D position and an RGB color.
-/// `#[repr(C)]` + `Pod`/`Zeroable` let us copy this straight into a GPU buffer.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Vertex {
@@ -37,8 +35,6 @@ struct Vertex {
 }
 
 impl Vertex {
-    /// Describes the memory layout of `Vertex` so the GPU can read it:
-    /// attribute 0 = position (3 floats), attribute 1 = color (3 floats).
     const ATTRIBS: [wgpu::VertexAttribute; 2] =
         wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
 
@@ -51,10 +47,8 @@ impl Vertex {
     }
 }
 
-/// Build the ground grid as a list of line endpoints (drawn as a LineList, so
-/// every two vertices form one line). Lines run from -`half`..=`half` on each
-/// axis, `spacing` units apart. The center lines are colored as the X (red) and
-/// Z (blue) axes; the rest are gray.
+/// Build the ground grid as line endpoints (drawn as a LineList). Center lines
+/// are colored as the X (red) and Z (blue) axes; the rest are gray.
 fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     let mut verts = Vec::new();
     let max = half as f32 * spacing;
@@ -66,12 +60,10 @@ fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
     for i in -half..=half {
         let p = i as f32 * spacing;
 
-        // Line parallel to the Z axis (constant x = p). At x = 0 it IS the Z axis.
         let c = if i == 0 { z_axis } else { gray };
         verts.push(Vertex { position: [p, 0.0, -max], color: c });
         verts.push(Vertex { position: [p, 0.0, max], color: c });
 
-        // Line parallel to the X axis (constant z = p). At z = 0 it IS the X axis.
         let c = if i == 0 { x_axis } else { gray };
         verts.push(Vertex { position: [-max, 0.0, p], color: c });
         verts.push(Vertex { position: [max, 0.0, p], color: c });
@@ -81,26 +73,62 @@ fn build_grid(half: i32, spacing: f32) -> Vec<Vertex> {
 }
 
 // ---------------------------------------------------------------------------
-// Camera
+// Orbit camera
 // ---------------------------------------------------------------------------
 
-/// A simple look-at camera. (Static in this step; Step 2 will let you move it.)
-struct Camera {
-    eye: Vec3,
+/// A camera that orbits around a focus point (`target`). Its position is defined
+/// in spherical coordinates: a `distance` from the target plus `yaw`/`pitch`
+/// angles. This is the classic 3D-editor viewport camera.
+struct OrbitCamera {
     target: Vec3,
-    up: Vec3,
+    distance: f32,
+    yaw: f32,   // radians, rotation around the Y (up) axis
+    pitch: f32, // radians, elevation above/below the horizon
     fovy_radians: f32,
     znear: f32,
     zfar: f32,
 }
 
-impl Camera {
+impl OrbitCamera {
+    /// World-space position of the camera, derived from the orbit parameters.
+    fn eye(&self) -> Vec3 {
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
+        let offset = Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw);
+        self.target + offset * self.distance
+    }
+
     /// Combined view * projection matrix for the given aspect ratio.
-    /// `perspective_rh` produces wgpu's 0..1 depth range (unlike OpenGL's -1..1).
     fn view_proj(&self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye, self.target, self.up);
+        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Y);
         let proj = Mat4::perspective_rh(self.fovy_radians, aspect, self.znear, self.zfar);
         proj * view
+    }
+
+    /// Left-drag: rotate around the target. `dx`/`dy` are mouse-motion pixels.
+    fn orbit(&mut self, dx: f32, dy: f32) {
+        const SENSITIVITY: f32 = 0.005;
+        self.yaw -= dx * SENSITIVITY;
+        self.pitch -= dy * SENSITIVITY;
+        // Stop just short of straight up/down so the view never flips over.
+        let limit = std::f32::consts::FRAC_PI_2 - 0.01;
+        self.pitch = self.pitch.clamp(-limit, limit);
+    }
+
+    /// Right-drag: slide the focus point within the camera's view plane.
+    fn pan(&mut self, dx: f32, dy: f32) {
+        let forward = (self.target - self.eye()).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+        // Scale by distance so panning feels the same whether zoomed in or out.
+        let speed = self.distance * 0.0015;
+        self.target += (-right * dx + up * dy) * speed;
+    }
+
+    /// Scroll: move closer to / farther from the target.
+    fn zoom(&mut self, scroll: f32) {
+        let factor = (1.0 - scroll * 0.1).clamp(0.5, 1.5);
+        self.distance = (self.distance * factor).clamp(1.0, 80.0);
     }
 }
 
@@ -131,22 +159,26 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
 
-    // Step 1 additions:
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
     depth_view: wgpu::TextureView,
-    camera: Camera,
+
+    camera: OrbitCamera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+
+    // Mouse drag state.
+    mouse_left_down: bool,
+    mouse_right_down: bool,
 }
 
 impl State {
     fn new(window: Arc<Window>) -> State {
         let size = window.inner_size();
 
-        // --- Core wgpu setup (same as Step 0) ---
+        // --- Core wgpu setup ---
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance
             .create_surface(window.clone())
@@ -174,16 +206,15 @@ impl State {
             .expect("this surface is not supported by the adapter");
         surface.configure(&device, &config);
 
-        // --- Depth buffer ---
         let depth_view = create_depth_view(&device, &config);
 
-        // --- Camera ---
-        // Positioned up and to the side, looking at the origin: a 3/4 view that
-        // shows the grid receding into the distance.
-        let camera = Camera {
-            eye: Vec3::new(8.0, 6.0, 8.0),
+        // --- Camera (orbit) ---
+        // Starting angles roughly reproduce Step 1's 3/4 view of the grid.
+        let camera = OrbitCamera {
             target: Vec3::ZERO,
-            up: Vec3::Y,
+            distance: 14.0,
+            yaw: std::f32::consts::FRAC_PI_4, // 45 degrees
+            pitch: 0.5,                       // ~28 degrees above the horizon
             fovy_radians: 45.0_f32.to_radians(),
             znear: 0.1,
             zfar: 100.0,
@@ -254,7 +285,6 @@ impl State {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                // Draw the vertices as a list of independent line segments.
                 topology: wgpu::PrimitiveTopology::LineList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
@@ -299,6 +329,8 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            mouse_left_down: false,
+            mouse_right_down: false,
         }
     }
 
@@ -306,29 +338,28 @@ impl State {
         self.config.width.max(1) as f32 / self.config.height.max(1) as f32
     }
 
-    /// Re-create the surface + depth buffer and refresh the camera when resized.
+    /// Recompute the camera matrix and upload it to the GPU. Call after any
+    /// camera change (orbit/pan/zoom/resize).
+    fn update_camera(&mut self) {
+        self.camera_uniform.view_proj = self.camera.view_proj(self.aspect()).to_cols_array_2d();
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
+    }
+
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-
-            // The depth buffer must match the new window size.
             self.depth_view = create_depth_view(&self.device, &self.config);
-
-            // Aspect ratio changed, so recompute the camera matrix and upload it.
-            self.camera_uniform.view_proj =
-                self.camera.view_proj(self.aspect()).to_cols_array_2d();
-            self.queue.write_buffer(
-                &self.camera_buffer,
-                0,
-                bytemuck::cast_slice(&[self.camera_uniform]),
-            );
+            self.update_camera();
         }
     }
 
-    /// Draw one frame: clear color + depth, then draw the grid.
     fn render(&mut self) {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -369,7 +400,6 @@ impl State {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                // Clear the depth buffer to the farthest value (1.0) each frame.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -393,7 +423,6 @@ impl State {
     }
 }
 
-/// Create a depth texture matching the current surface size, return its view.
 fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -431,7 +460,7 @@ impl ApplicationHandler for App {
         }
 
         let attributes = Window::default_attributes()
-            .with_title("CoEngine — Step 1: 3D Grid")
+            .with_title("CoEngine — Step 2a: Orbit Camera  (left-drag orbit · right-drag pan · scroll zoom)")
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
 
         let window = Arc::new(
@@ -459,12 +488,70 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+
             WindowEvent::Resized(new_size) => {
                 state.resize(new_size);
                 state.window.request_redraw();
             }
+
             WindowEvent::RedrawRequested => state.render(),
+
+            // Track which mouse buttons are held (for drag orbit/pan).
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => {
+                let pressed = btn_state == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => state.mouse_left_down = pressed,
+                    MouseButton::Right => state.mouse_right_down = pressed,
+                    _ => {}
+                }
+            }
+
+            // Scroll wheel zooms.
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 120.0,
+                };
+                state.camera.zoom(scroll);
+                state.update_camera();
+                state.window.request_redraw();
+            }
+
             _ => {}
+        }
+    }
+
+    /// Raw mouse-motion deltas (good for drag-to-orbit/pan).
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            let (dx, dy) = (dx as f32, dy as f32);
+            let mut changed = false;
+
+            if state.mouse_left_down {
+                state.camera.orbit(dx, dy);
+                changed = true;
+            } else if state.mouse_right_down {
+                state.camera.pan(dx, dy);
+                changed = true;
+            }
+
+            if changed {
+                state.update_camera();
+                state.window.request_redraw();
+            }
         }
     }
 }
