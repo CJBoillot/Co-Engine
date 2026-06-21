@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{EulerRot, Mat4, Quat, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.15";
+pub(crate) const CO_VERSION: &str = "0.0.16";
 
 mod ai;
 use ai::*;
@@ -75,6 +75,8 @@ use project::*;
 pub(crate) enum DockTab {
     Scene,
     Logic,
+    /// Inspector / properties panel for the selected object.
+    Inspector,
     /// Project file tree (IDE-style). `alias = "Code"` keeps v0.0.12 layouts
     /// (which serialized this tab as "Code") loadable.
     #[serde(alias = "Code")]
@@ -130,6 +132,19 @@ struct UiState {
     last_project_name: Option<String>,
     /// Transient status line shown in the Menu after a save/open (e.g. errors).
     project_status: Option<String>,
+    /// One-shot requests from the scene outliner (Logic tab), serviced in `update`.
+    outliner_select: Option<usize>,
+    outliner_delete: Option<usize>,
+    outliner_add: bool,
+    /// Inspector edit requests: the edited entity (live) + a commit flag (undo).
+    inspector_apply: Option<Entity>,
+    inspector_commit: bool,
+    /// Gizmo-mode switch requested from the on-screen toolbar.
+    gizmo_mode_req: Option<GizmoMode>,
+    /// Uniform scale requested from the on-screen scale slider (live), plus a
+    /// commit flag (record one undo entry when the slider interaction ends).
+    scale_req: Option<f32>,
+    scale_commit: bool,
 }
 
 impl Default for UiState {
@@ -154,6 +169,14 @@ impl Default for UiState {
             open_last_requested: false,
             last_project_name: None,
             project_status: None,
+            outliner_select: None,
+            outliner_delete: None,
+            outliner_add: false,
+            inspector_apply: None,
+            inspector_commit: false,
+            gizmo_mode_req: None,
+            scale_req: None,
+            scale_commit: false,
         }
     }
 }
@@ -163,6 +186,7 @@ fn dock_tab_label(tab: &DockTab) -> String {
     match tab {
         DockTab::Scene => "3D Scene".to_string(),
         DockTab::Logic => "Logic".to_string(),
+        DockTab::Inspector => "Inspector".to_string(),
         DockTab::Explorer => "Explorer".to_string(),
         DockTab::AiChat => "AI Chat".to_string(),
         DockTab::Log => "Log".to_string(),
@@ -173,6 +197,557 @@ fn dock_tab_label(tab: &DockTab) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.display().to_string()),
     }
+}
+
+/// A small hand-drawn trash-can button (egui's default fonts lack a glyph for
+/// it). Returns true on click.
+fn trash_button(ui: &mut egui::Ui) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    let hov = resp.hovered();
+    let col = if hov {
+        egui::Color32::from_rgb(228, 120, 110)
+    } else {
+        egui::Color32::from_gray(150)
+    };
+    let p = ui.painter();
+    if hov {
+        p.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(60));
+    }
+    let c = rect.center();
+    let (w, h) = (9.0_f32, 11.0_f32);
+    let s = egui::Stroke::new(1.4, col);
+    let lid_y = c.y - h * 0.42;
+    // lid + handle
+    p.line_segment([egui::pos2(c.x - w * 0.6, lid_y), egui::pos2(c.x + w * 0.6, lid_y)], s);
+    p.line_segment(
+        [egui::pos2(c.x - w * 0.22, lid_y - 2.0), egui::pos2(c.x + w * 0.22, lid_y - 2.0)],
+        s,
+    );
+    p.line_segment([egui::pos2(c.x - w * 0.22, lid_y - 2.0), egui::pos2(c.x - w * 0.22, lid_y)], s);
+    p.line_segment([egui::pos2(c.x + w * 0.22, lid_y - 2.0), egui::pos2(c.x + w * 0.22, lid_y)], s);
+    // tapered body
+    let (top_y, bot_y) = (lid_y + 1.5, c.y + h * 0.5);
+    let (tlx, trx) = (c.x - w * 0.46, c.x + w * 0.46);
+    let (blx, brx) = (c.x - w * 0.34, c.x + w * 0.34);
+    p.line_segment([egui::pos2(tlx, top_y), egui::pos2(blx, bot_y)], s);
+    p.line_segment([egui::pos2(trx, top_y), egui::pos2(brx, bot_y)], s);
+    p.line_segment([egui::pos2(blx, bot_y), egui::pos2(brx, bot_y)], s);
+    // ribs
+    for fx in [-0.18, 0.0, 0.18] {
+        let x = c.x + w * fx;
+        p.line_segment(
+            [egui::pos2(x, top_y + 1.5), egui::pos2(x, bot_y - 1.5)],
+            egui::Stroke::new(1.0, col),
+        );
+    }
+    resp.on_hover_text("Delete object").clicked()
+}
+
+/// Which icon a gizmo-toolbar button draws.
+#[derive(Clone, Copy)]
+enum ToolIcon {
+    Move,
+    Rotate,
+    Scale,
+    Delete,
+}
+
+/// A WoW-Housing-style icon button for the on-screen gizmo toolbar. Drawn by
+/// hand (egui has no icon font). Highlights when active or hovered.
+fn tool_button(ui: &mut egui::Ui, icon: ToolIcon, active: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
+    let hov = resp.hovered();
+    let bg = if active {
+        egui::Color32::from_rgb(70, 56, 30)
+    } else if hov {
+        egui::Color32::from_rgb(44, 46, 54)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(30, 32, 40, 200)
+    };
+    let p = ui.painter();
+    p.rect(
+        rect,
+        egui::Rounding::same(6.0),
+        bg,
+        egui::Stroke::new(
+            1.0,
+            if active {
+                ACCENT_GOLD
+            } else {
+                egui::Color32::from_gray(70)
+            },
+        ),
+    );
+    let col = if active {
+        ACCENT_GOLD
+    } else {
+        egui::Color32::from_gray(210)
+    };
+    let c = rect.center();
+    let s = egui::Stroke::new(1.8, col);
+    match icon {
+        ToolIcon::Move => {
+            for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+                let dir = egui::vec2(dx, dy);
+                let perp = egui::vec2(-dy, dx);
+                let tip = c + dir * 9.0;
+                let base = tip - dir * 4.0;
+                p.line_segment([c, tip], s);
+                p.line_segment([tip, base + perp * 3.0], s);
+                p.line_segment([tip, base - perp * 3.0], s);
+            }
+        }
+        ToolIcon::Rotate => {
+            let r = 8.0;
+            let mut prev: Option<egui::Pos2> = None;
+            let (a0, a1) = (-2.2_f32, 2.6_f32);
+            for i in 0..=22 {
+                let a = a0 + (a1 - a0) * i as f32 / 22.0;
+                let pt = c + egui::vec2(a.cos() * r, a.sin() * r);
+                if let Some(pp) = prev {
+                    p.line_segment([pp, pt], s);
+                }
+                prev = Some(pt);
+            }
+            // arrowhead at the arc end
+            let tip = c + egui::vec2(a1.cos() * r, a1.sin() * r);
+            let tang = egui::vec2(-a1.sin(), a1.cos());
+            let radial = egui::vec2(a1.cos(), a1.sin());
+            p.line_segment([tip, tip - tang * 4.0 + radial * 3.0], s);
+            p.line_segment([tip, tip - tang * 4.0 - radial * 3.0], s);
+        }
+        ToolIcon::Scale => {
+            // A small square with a diagonal expand arrow.
+            let r = 6.5;
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)),
+                1.0,
+                s,
+            );
+            let tip = c + egui::vec2(r + 3.0, -(r + 3.0));
+            p.line_segment([c, tip], s);
+            p.line_segment([tip, tip + egui::vec2(-4.0, 0.0)], s);
+            p.line_segment([tip, tip + egui::vec2(0.0, 4.0)], s);
+        }
+        ToolIcon::Delete => {
+            let (w, h) = (9.0_f32, 11.0_f32);
+            let lid_y = c.y - h * 0.42;
+            p.line_segment([egui::pos2(c.x - w * 0.6, lid_y), egui::pos2(c.x + w * 0.6, lid_y)], s);
+            let (top_y, bot_y) = (lid_y + 1.5, c.y + h * 0.5);
+            let (tlx, trx) = (c.x - w * 0.46, c.x + w * 0.46);
+            let (blx, brx) = (c.x - w * 0.34, c.x + w * 0.34);
+            p.line_segment([egui::pos2(tlx, top_y), egui::pos2(blx, bot_y)], s);
+            p.line_segment([egui::pos2(trx, top_y), egui::pos2(brx, bot_y)], s);
+            p.line_segment([egui::pos2(blx, bot_y), egui::pos2(brx, bot_y)], s);
+        }
+    }
+    resp.clicked()
+}
+
+/// A small triangle arrow button (◄ / ►) for the scale slider ends.
+fn arrow_button(ui: &mut egui::Ui, right: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 20.0), egui::Sense::click());
+    let col = if resp.hovered() {
+        ACCENT_GOLD
+    } else {
+        egui::Color32::from_gray(190)
+    };
+    let c = rect.center();
+    let dx = if right { 4.0 } else { -4.0 };
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x + dx, c.y),
+            egui::pos2(c.x - dx, c.y - 5.0),
+            egui::pos2(c.x - dx, c.y + 5.0),
+        ],
+        col,
+        egui::Stroke::NONE,
+    ));
+    resp.clicked()
+}
+
+/// WoW-Housing-style horizontal scale slider: a segmented track with a knob, end
+/// arrows, and a % readout. Edits drive `req` (live) and `commit` (on release).
+fn scale_slider(ui: &mut egui::Ui, value: f32, req: &mut Option<f32>, commit: &mut bool) {
+    let frac = ((value - SCALE_MIN) / (SCALE_MAX - SCALE_MIN)).clamp(0.0, 1.0);
+    ui.horizontal(|ui| {
+        if arrow_button(ui, false) {
+            *req = Some((value - 0.05).clamp(SCALE_MIN, SCALE_MAX));
+            *commit = true;
+        }
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(210.0, 18.0), egui::Sense::click_and_drag());
+        let p = ui.painter();
+        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 8.0));
+        p.rect_filled(track, 4.0, egui::Color32::from_rgb(40, 42, 50));
+        // filled portion
+        let fill = egui::Rect::from_min_size(
+            track.min,
+            egui::vec2(track.width() * frac, track.height()),
+        );
+        p.rect_filled(fill, 4.0, egui::Color32::from_rgb(150, 120, 60));
+        // segment ticks
+        for i in 1..10 {
+            let x = track.left() + track.width() * i as f32 / 10.0;
+            p.line_segment(
+                [egui::pos2(x, track.top()), egui::pos2(x, track.bottom())],
+                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70)),
+            );
+        }
+        // knob (diamond)
+        let kx = track.left() + track.width() * frac;
+        let kc = egui::pos2(kx, track.center().y);
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(kc.x, kc.y - 8.0),
+                egui::pos2(kc.x + 7.0, kc.y),
+                egui::pos2(kc.x, kc.y + 8.0),
+                egui::pos2(kc.x - 7.0, kc.y),
+            ],
+            ACCENT_GOLD,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(30)),
+        ));
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let f = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                *req = Some(SCALE_MIN + f * (SCALE_MAX - SCALE_MIN));
+            }
+        }
+        if resp.drag_stopped() {
+            *commit = true;
+        }
+        if arrow_button(ui, true) {
+            *req = Some((value + 0.05).clamp(SCALE_MIN, SCALE_MAX));
+            *commit = true;
+        }
+    });
+    ui.label(
+        egui::RichText::new(format!("{:.0}%", value * 100.0))
+            .strong()
+            .color(ACCENT_GOLD),
+    );
+}
+
+/// Scene outliner (the Logic tab): a flat list of the scene's objects with
+/// select / delete, plus an add button. Requests flow back to `State` via the
+/// out-params (serviced in `update`). Rename + properties come from the inspector.
+fn outliner_ui(
+    ui: &mut egui::Ui,
+    names: &[String],
+    selected: Option<usize>,
+    select_req: &mut Option<usize>,
+    delete_req: &mut Option<usize>,
+    add_req: &mut bool,
+) {
+    egui::TopBottomPanel::top("outliner_header").show_inside(ui, |ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading("Scene");
+            ui.label(egui::RichText::new(format!("· {} objects", names.len())).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("+ Cube").on_hover_text("Add a cube (C)").clicked() {
+                    *add_req = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+    });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        if names.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("No objects yet — press C or “+ Cube”.");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, name) in names.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(Some(i) == selected, name)
+                            .clicked()
+                        {
+                            *select_req = Some(i);
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if trash_button(ui) {
+                                    *delete_req = Some(i);
+                                }
+                            },
+                        );
+                    });
+                }
+            });
+    });
+}
+
+/// One labelled X/Y/Z row of drag values editing a `Vec3`. Returns true if any
+/// component changed this frame; sets `*ended` when a drag/edit finishes.
+fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut glam::Vec3, speed: f32, ended: &mut bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([62.0, 18.0], egui::Label::new(label));
+        for comp in [&mut v.x, &mut v.y, &mut v.z] {
+            let r = ui.add(egui::DragValue::new(comp).speed(speed).fixed_decimals(2));
+            changed |= r.changed();
+            if r.drag_stopped() || r.lost_focus() {
+                *ended = true;
+            }
+        }
+    });
+    changed
+}
+
+/// Inspector / properties panel: edit the selected entity's name + transform +
+/// color. Edits flow back to `State` via `apply` (live) and `commit` (records an
+/// undo entry once the edit finishes).
+fn inspector_ui(
+    ui: &mut egui::Ui,
+    entity: Option<&Entity>,
+    apply: &mut Option<Entity>,
+    commit: &mut bool,
+) {
+    let Some(src) = entity else {
+        ui.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new("Select an object to edit its properties.").weak());
+        });
+        return;
+    };
+    let mut e = src.clone();
+    let mut changed = false;
+    let mut ended = false;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.heading("Inspector");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_sized([62.0, 18.0], egui::Label::new("Name"));
+                let r = ui.text_edit_singleline(&mut e.name);
+                changed |= r.changed();
+                if r.lost_focus() {
+                    ended = true;
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Transform").strong().color(ACCENT_GOLD));
+            changed |= vec3_row(ui, "Position", &mut e.pos, 0.05, &mut ended);
+            changed |= vec3_row(ui, "Rotation°", &mut e.rotation, 0.5, &mut ended);
+            changed |= vec3_row(ui, "Scale", &mut e.scale, 0.02, &mut ended);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_sized([62.0, 18.0], egui::Label::new("Color"));
+                let r = ui.color_edit_button_rgb(&mut e.color);
+                if r.changed() {
+                    changed = true;
+                    ended = true;
+                }
+            });
+        });
+
+    if changed {
+        *apply = Some(e);
+    }
+    if ended {
+        *commit = true;
+    }
+}
+
+/// Project a world point into the viewport's screen space, or None if behind
+/// the camera.
+fn project_to_screen(w: glam::Vec3, view_proj: glam::Mat4, rect: egui::Rect) -> Option<egui::Pos2> {
+    let clip = view_proj * w.extend(1.0);
+    if clip.w <= 0.001 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(egui::pos2(
+        rect.left() + (ndc.x * 0.5 + 0.5) * rect.width(),
+        rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
+    ))
+}
+
+/// World length of each gizmo axis arrow (also used by the engine's hit-testing).
+pub(crate) const GIZMO_AXIS_LEN: f32 = 1.3;
+
+/// The three gizmo axis colors (X red, Y green, Z blue).
+const AXIS_COLORS: [egui::Color32; 3] = [
+    egui::Color32::from_rgb(222, 74, 64),
+    egui::Color32::from_rgb(96, 200, 96),
+    egui::Color32::from_rgb(82, 132, 236),
+];
+
+/// Draw the translate gizmo: three world-axis arrows (with arrowheads) for the
+/// object at `obj_pos`. While an axis is being dragged (`active = Some`), only
+/// that axis is shown. Drawing only — the drag is handled by the engine's input.
+fn draw_translate_gizmo(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    view_proj: glam::Mat4,
+    obj_pos: glam::Vec3,
+    active: Option<usize>,
+) {
+    let Some(center) = project_to_screen(obj_pos, view_proj, rect) else {
+        return;
+    };
+    for (ai, dir) in [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z].iter().enumerate() {
+        if active.is_some() && active != Some(ai) {
+            continue; // hide the other axes while dragging one
+        }
+        let Some(tip) = project_to_screen(obj_pos + *dir * GIZMO_AXIS_LEN, view_proj, rect)
+        else {
+            continue;
+        };
+        let color = AXIS_COLORS[ai];
+        let hot = active == Some(ai);
+        painter.line_segment([center, tip], egui::Stroke::new(if hot { 4.0 } else { 3.0 }, color));
+        // Arrowhead (filled triangle pointing outward along the axis).
+        let d = tip - center;
+        let dn = d / d.length().max(1.0);
+        let perp = egui::vec2(-dn.y, dn.x);
+        let size = if hot { 13.0 } else { 11.0 };
+        let base = tip - dn * size;
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, base + perp * (size * 0.5), base - perp * (size * 0.5)],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    painter.circle_filled(center, 4.0, egui::Color32::from_gray(235));
+}
+
+/// The two in-plane basis vectors of the rotation ring for `axis` (the plane
+/// perpendicular to that world axis).
+fn ring_basis(axis: usize) -> (glam::Vec3, glam::Vec3) {
+    // Each (u, v) is right-handed with its axis (u × v = axis), so +rotation
+    // increases the in-plane angle uniformly — without this the Y ring inverts.
+    match axis {
+        0 => (glam::Vec3::Y, glam::Vec3::Z), // Y × Z = X
+        1 => (glam::Vec3::Z, glam::Vec3::X), // Z × X = Y
+        _ => (glam::Vec3::X, glam::Vec3::Y), // X × Y = Z
+    }
+}
+
+/// Local anchor direction of each axis's ball handle, in the object's frame.
+/// The ball is rigidly attached here (so it moves with the whole object).
+const ROT_ANCHOR: [glam::Vec3; 3] = [glam::Vec3::Y, glam::Vec3::Z, glam::Vec3::X];
+
+/// The object's rotation as a quaternion (euler degrees → quat).
+fn obj_quat(rot_deg: glam::Vec3) -> glam::Quat {
+    glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        rot_deg.x.to_radians(),
+        rot_deg.y.to_radians(),
+        rot_deg.z.to_radians(),
+    )
+}
+
+/// World position of the ball handle for `axis` — its local anchor rigidly
+/// transformed by the object's full rotation (so it sticks to the object).
+fn rotate_ball_world(axis: usize, center: glam::Vec3, rot_deg: glam::Vec3) -> glam::Vec3 {
+    center + obj_quat(rot_deg) * (ROT_ANCHOR[axis] * GIZMO_AXIS_LEN)
+}
+
+/// Project to screen + return clip-space `w` (a camera-distance proxy for depth).
+fn project_depth(w: glam::Vec3, view_proj: glam::Mat4, rect: egui::Rect) -> Option<(egui::Pos2, f32)> {
+    let clip = view_proj * w.extend(1.0);
+    if clip.w <= 0.001 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some((
+        egui::pos2(
+            rect.left() + (ndc.x * 0.5 + 0.5) * rect.width(),
+            rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
+        ),
+        clip.w,
+    ))
+}
+
+/// A color dimmed (more transparent) to read as "behind the object".
+fn dim(c: egui::Color32, a: u8) -> egui::Color32 {
+    let [r, g, b, _] = c.to_array();
+    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// Draw the rotate gizmo: three rings centered on the object and tilted with it
+/// (object-local), each carrying a ball handle. The half of each ring behind the
+/// object is dimmed so the object reads as occluding it. While dragging
+/// (`active = Some`), only that axis is shown.
+fn draw_rotate_gizmo(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    view_proj: glam::Mat4,
+    obj_pos: glam::Vec3,
+    rot_deg: glam::Vec3,
+    active: Option<usize>,
+) {
+    let q = obj_quat(rot_deg);
+    let center_depth = project_depth(obj_pos, view_proj, rect).map_or(1.0, |(_, d)| d);
+    for axis in 0..3 {
+        if active.is_some() && active != Some(axis) {
+            continue;
+        }
+        let color = AXIS_COLORS[axis];
+        let hot = active == Some(axis);
+        let (ul, vl) = ring_basis(axis);
+        let (u, v) = (q * ul, q * vl);
+        let mut prev: Option<(egui::Pos2, f32)> = None;
+        for i in 0..=72 {
+            let a = i as f32 / 72.0 * std::f32::consts::TAU;
+            let p = obj_pos + (u * a.cos() + v * a.sin()) * GIZMO_AXIS_LEN;
+            let cur = project_depth(p, view_proj, rect);
+            if let (Some((pa, da)), Some((pb, db))) = (prev, cur) {
+                let behind = (da + db) * 0.5 > center_depth + 0.02;
+                let c = if behind { dim(color, 70) } else { color };
+                painter.line_segment([pa, pb], egui::Stroke::new(if hot { 3.0 } else { 2.0 }, c));
+            }
+            prev = cur;
+        }
+        // Ball handle, stuck to the object.
+        if let Some((b, bd)) = project_depth(obj_pos + q * (ROT_ANCHOR[axis] * GIZMO_AXIS_LEN), view_proj, rect) {
+            let behind = bd > center_depth + 0.02;
+            let r = if hot { 11.0 } else { 8.5 };
+            painter.circle_filled(b, r, if behind { dim(color, 120) } else { color });
+            painter.circle_filled(b, r * 0.4, egui::Color32::from_gray(245));
+        }
+    }
+    if let Some(center) = project_to_screen(obj_pos, view_proj, rect) {
+        painter.circle_filled(center, 4.0, egui::Color32::from_gray(235));
+    }
+}
+
+/// Draw the scale gizmo: three world-axis stalks with square handles (uniform
+/// scale). While dragging (`active = Some`), only that axis is shown.
+fn draw_scale_gizmo(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    view_proj: glam::Mat4,
+    obj_pos: glam::Vec3,
+    active: Option<usize>,
+) {
+    let Some(center) = project_to_screen(obj_pos, view_proj, rect) else {
+        return;
+    };
+    for (ai, dir) in [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z].iter().enumerate() {
+        if active.is_some() && active != Some(ai) {
+            continue;
+        }
+        let Some(tip) = project_to_screen(obj_pos + *dir * GIZMO_AXIS_LEN, view_proj, rect)
+        else {
+            continue;
+        };
+        let color = AXIS_COLORS[ai];
+        let hot = active == Some(ai);
+        painter.line_segment([center, tip], egui::Stroke::new(if hot { 4.0 } else { 3.0 }, color));
+        let h = if hot { 9.0 } else { 7.0 };
+        painter.rect_filled(egui::Rect::from_center_size(tip, egui::vec2(h, h)), 1.0, color);
+    }
+    painter.circle_filled(center, 4.0, egui::Color32::from_gray(235));
 }
 
 /// Draw an eyeball (almond sclera + iris + pupil) centered at `c`. Muted by
@@ -250,6 +825,15 @@ struct EngineTabs<'a> {
     close_req: &'a mut Option<DockTab>,
     /// Whether Focus mode is currently active (colors the eye, flips its action).
     in_focus: bool,
+    /// Scene outliner (Logic tab): entity names + selection + request out-params.
+    outliner: &'a [String],
+    outliner_select: &'a mut Option<usize>,
+    outliner_delete: &'a mut Option<usize>,
+    outliner_add: &'a mut bool,
+    /// Inspector: the selected entity (clone) + edit out-params.
+    inspector: Option<Entity>,
+    inspector_apply: &'a mut Option<Entity>,
+    inspector_commit: &'a mut bool,
 }
 
 impl TabViewer for EngineTabs<'_> {
@@ -286,9 +870,22 @@ impl TabViewer for EngineTabs<'_> {
                 *self.scene_rect_out = Some(ui.max_rect());
             }
             DockTab::Logic => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Logic — coming soon").heading().weak());
-                });
+                outliner_ui(
+                    ui,
+                    self.outliner,
+                    self.scene.selected,
+                    self.outliner_select,
+                    self.outliner_delete,
+                    self.outliner_add,
+                );
+            }
+            DockTab::Inspector => {
+                inspector_ui(
+                    ui,
+                    self.inspector.as_ref(),
+                    self.inspector_apply,
+                    self.inspector_commit,
+                );
             }
             DockTab::Explorer => match &self.project_root {
                 Some(root) => file_tree_ui(ui, root, self.open_file_req),
@@ -400,11 +997,17 @@ fn build_ui(
     logo: Option<&egui::TextureHandle>,
     splash: Option<&egui::TextureHandle>,
     loading: bool,
+    view_proj: Mat4,
+    gizmo_axis: Option<usize>,
+    gizmo_mode: GizmoMode,
     scene: &SceneSnapshot,
+    outliner: &[String],
+    inspector: Option<&Entity>,
     controls: &Controls,
     history: &[HistoryEntry],
     history_cursor: usize,
     project_path: Option<&Path>,
+    project_dirty: bool,
     file_cache: &mut HashMap<PathBuf, FileView>,
     terminal: &mut TerminalState,
     git: &mut GitUi,
@@ -412,6 +1015,7 @@ fn build_ui(
     focus_restore: &mut Option<DockState<DockTab>>,
     dock_state: &mut DockState<DockTab>,
     scene_rect_out: &mut Option<egui::Rect>,
+    toolbar_rect_out: &mut Option<egui::Rect>,
 ) {
     // Apply the selected theme + mode (UI only — the 3D background is fixed).
     ctx.set_visuals(theme_visuals(ui_state.theme, ui_state.dark_mode));
@@ -529,6 +1133,7 @@ fn build_ui(
             let tabs = [
                 (DockTab::Scene, "3D Scene"),
                 (DockTab::Logic, "Logic"),
+                (DockTab::Inspector, "Inspector"),
                 (DockTab::Explorer, "Explorer"),
                 (DockTab::AiChat, "AI Chat"),
                 (DockTab::Log, "Log"),
@@ -602,11 +1207,28 @@ fn build_ui(
     let any_dirty = file_cache.values().any(FileView::is_dirty);
     let mut do_save = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
     let mut do_save_all = false;
+    let mut do_save_project = false;
     egui::TopBottomPanel::top("tool_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
+            // Save the whole project (scene + settings + layout). Always available;
+            // a leading dot marks unsaved changes.
+            let label = if project_dirty {
+                "● Save Project"
+            } else {
+                "Save Project"
+            };
             if ui
-                .add_enabled(active_dirty, egui::Button::new("Save"))
+                .button(label)
+                .on_hover_text("Save the project — scene, settings, and layout")
+                .clicked()
+            {
+                do_save_project = true;
+            }
+            ui.separator();
+            // File saves (the active editor file).
+            if ui
+                .add_enabled(active_dirty, egui::Button::new("Save File"))
                 .on_hover_text("Save the active file (Ctrl+S)")
                 .clicked()
             {
@@ -622,6 +1244,9 @@ fn build_ui(
             ui.label(egui::RichText::new("Tools").small());
         });
     });
+    if do_save_project {
+        ui_state.save_requested = true;
+    }
     if do_save && active_dirty {
         if let Some(p) = active_file {
             match save_file(&p, file_cache) {
@@ -666,6 +1291,13 @@ fn build_ui(
             focus_req: &mut focus_req,
             close_req: &mut close_req,
             in_focus: focus_restore.is_some(),
+            outliner,
+            outliner_select: &mut ui_state.outliner_select,
+            outliner_delete: &mut ui_state.outliner_delete,
+            outliner_add: &mut ui_state.outliner_add,
+            inspector: inspector.cloned(),
+            inspector_apply: &mut ui_state.inspector_apply,
+            inspector_commit: &mut ui_state.inspector_commit,
         };
         DockArea::new(dock_state)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -764,6 +1396,25 @@ fn build_ui(
                             .color(dim)
                             .small(),
                         );
+                        // Object nudge controls — only while something is selected.
+                        if scene.selected.is_some() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "selected:  Arrows = move · PgUp/PgDn = height",
+                                )
+                                .color(text)
+                                .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    ", / . = rotate · R = move/rotate gizmo · X = grid · {} = delete",
+                                    key_label(controls.remove),
+                                ))
+                                .color(text)
+                                .small(),
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(format!("CoEngine v{CO_VERSION}"))
                                 .monospace()
@@ -772,6 +1423,109 @@ fn build_ui(
                     });
             });
         }
+    }
+
+    // Translate gizmo over the selected object (draw-only; the drag is handled
+    // by the engine's input). A foreground layer painter doesn't register an
+    // interactive area, so it never blocks the camera.
+    if let (Some(i), Some(rect)) = (scene.selected, scene_rect) {
+        if let Some((obj_pos, _)) = scene.cubes.get(i).copied() {
+            let mut painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("gizmo_draw"),
+            ));
+            painter.set_clip_rect(rect);
+            match gizmo_mode {
+                GizmoMode::Translate => {
+                    draw_translate_gizmo(&painter, rect, view_proj, obj_pos, gizmo_axis);
+                }
+                GizmoMode::Rotate => {
+                    let rot = inspector.map(|e| e.rotation).unwrap_or(glam::Vec3::ZERO);
+                    draw_rotate_gizmo(&painter, rect, view_proj, obj_pos, rot, gizmo_axis);
+                    // Live angle readout while dragging a ring.
+                    if let (Some(ax), Some(e), Some(c)) = (
+                        gizmo_axis,
+                        inspector,
+                        project_to_screen(obj_pos, view_proj, rect),
+                    ) {
+                        let deg = [e.rotation.x, e.rotation.y, e.rotation.z][ax].rem_euclid(360.0);
+                        painter.text(
+                            c + egui::vec2(16.0, -16.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{deg:.0}°"),
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::from_gray(240),
+                        );
+                    }
+                }
+                GizmoMode::Scale => {
+                    draw_scale_gizmo(&painter, rect, view_proj, obj_pos, gizmo_axis);
+                    // Live percentage readout while dragging.
+                    if let (Some(_), Some(e), Some(c)) = (
+                        gizmo_axis,
+                        inspector,
+                        project_to_screen(obj_pos, view_proj, rect),
+                    ) {
+                        painter.text(
+                            c + egui::vec2(16.0, -16.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{:.0}%", e.scale.x * 100.0),
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::from_gray(240),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // On-screen gizmo toolbar (WoW-Housing-style), at the bottom-center of the
+    // scene when an object is selected. Its rect is recorded so clicks on it
+    // don't fall through to the camera / picking.
+    *toolbar_rect_out = None;
+    if let (Some(sel_i), Some(rect)) = (scene.selected, scene_rect) {
+        let area = egui::Area::new(egui::Id::new("gizmo_toolbar"))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(egui::pos2(rect.center().x, rect.bottom() - 14.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(18, 20, 26, 235))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 56, 30)))
+                    .rounding(egui::Rounding::same(9.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                        // Scale slider (WoW-style) sits above the tool buttons.
+                        if gizmo_mode == GizmoMode::Scale {
+                            let cur = inspector.map(|e| e.scale.x).unwrap_or(1.0);
+                            scale_slider(
+                                ui,
+                                cur,
+                                &mut ui_state.scale_req,
+                                &mut ui_state.scale_commit,
+                            );
+                            ui.add_space(4.0);
+                        }
+                        ui.horizontal(|ui| {
+                            if tool_button(ui, ToolIcon::Move, gizmo_mode == GizmoMode::Translate) {
+                                ui_state.gizmo_mode_req = Some(GizmoMode::Translate);
+                            }
+                            if tool_button(ui, ToolIcon::Rotate, gizmo_mode == GizmoMode::Rotate) {
+                                ui_state.gizmo_mode_req = Some(GizmoMode::Rotate);
+                            }
+                            if tool_button(ui, ToolIcon::Scale, gizmo_mode == GizmoMode::Scale) {
+                                ui_state.gizmo_mode_req = Some(GizmoMode::Scale);
+                            }
+                            ui.add_space(6.0);
+                            if tool_button(ui, ToolIcon::Delete, false) {
+                                ui_state.outliner_delete = Some(sel_i);
+                            }
+                        });
+                        });
+                    });
+            });
+        *toolbar_rect_out = Some(area.response.rect);
     }
 
     // Menu window (opened by Esc or the Menu button).
@@ -1108,7 +1862,7 @@ fn log_tab(
 #[derive(Clone)]
 struct HistoryEntry {
     label: String,
-    cubes: Vec<Cube>,
+    entities: Vec<Entity>,
     selected: Option<usize>,
 }
 
@@ -1142,6 +1896,45 @@ fn fallback_dock_state() -> DockState<DockTab> {
 // Renderer state
 // ---------------------------------------------------------------------------
 
+/// Held keys for nudging the selected object: move on the ground (fwd/back/
+/// left/right), height (up/down), and yaw rotation (rot_left/rot_right).
+#[derive(Default)]
+struct NudgeKeys {
+    fwd: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    rot_left: bool,
+    rot_right: bool,
+}
+
+/// Which transform gizmo is shown over the selected object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GizmoMode {
+    Translate,
+    Rotate,
+    Scale,
+}
+
+/// Uniform scale clamp for the scale gizmo (10% … 200%).
+const SCALE_MIN: f32 = 0.1;
+const SCALE_MAX: f32 = 2.0;
+
+impl NudgeKeys {
+    fn any(&self) -> bool {
+        self.fwd
+            || self.back
+            || self.left
+            || self.right
+            || self.up
+            || self.down
+            || self.rot_left
+            || self.rot_right
+    }
+}
+
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -1156,7 +1949,11 @@ struct State {
     grid_buffer: wgpu::Buffer,
     grid_vertex_count: u32,
 
-    cubes: Vec<Cube>,
+    entities: Vec<Entity>,
+    /// Next entity id to assign (monotonic; ids stay stable for the session).
+    next_id: u32,
+    /// True when the scene/settings have unsaved changes (drives the Save Project ●).
+    project_dirty: bool,
     cube_buffer: Option<wgpu::Buffer>,
     cube_vertex_count: u32,
     selected: Option<usize>,
@@ -1171,6 +1968,24 @@ struct State {
 
     keys: Keys,
     controls: Controls,
+    /// Held keys for nudging the selected object (WoW-Housing-style).
+    nudge: NudgeKeys,
+    /// True while the object is being nudged (to record one undo entry on stop).
+    nudging: bool,
+    /// Whether the ground grid is drawn (toggled with X).
+    show_grid: bool,
+    /// Which gizmo (move / rotate) is active for the selected object.
+    gizmo_mode: GizmoMode,
+    /// Screen rect (egui points) of the on-screen gizmo toolbar, so clicks on it
+    /// don't fall through to camera orbit / pick.
+    toolbar_rect: Option<egui::Rect>,
+    /// Which gizmo axis (0=X,1=Y,2=Z) is being dragged, if any.
+    gizmo_drag: Option<usize>,
+    /// Scale-drag start state: uniform scale + cursor distance from center at grab.
+    gizmo_scale_start: f32,
+    gizmo_scale_dist0: f32,
+    /// Whether Shift is held (fast keyboard nudge).
+    shift_down: bool,
     mouse_left_down: bool,
     mouse_right_down: bool,
     cursor_pos: (f32, f32),
@@ -1452,7 +2267,9 @@ impl State {
             depth_view,
             grid_buffer,
             grid_vertex_count,
-            cubes: Vec::new(),
+            entities: Vec::new(),
+            next_id: 1,
+            project_dirty: false,
             cube_buffer: None,
             cube_vertex_count: 0,
             selected: None,
@@ -1464,6 +2281,15 @@ impl State {
             mode,
             keys: Keys::default(),
             controls,
+            nudge: NudgeKeys::default(),
+            nudging: false,
+            show_grid: true,
+            gizmo_mode: GizmoMode::Translate,
+            toolbar_rect: None,
+            gizmo_drag: None,
+            gizmo_scale_start: 1.0,
+            gizmo_scale_dist0: 1.0,
+            shift_down: false,
             mouse_left_down: false,
             mouse_right_down: false,
             cursor_pos: (0.0, 0.0),
@@ -1480,7 +2306,7 @@ impl State {
             ui,
             history: vec![HistoryEntry {
                 label: "Session start".to_string(),
-                cubes: Vec::new(),
+                entities: Vec::new(),
                 selected: None,
             }],
             history_cursor: 0,
@@ -1549,23 +2375,36 @@ impl State {
         );
     }
 
+    /// Build a fresh entity with the next id and a default name/transform.
+    fn new_entity(&mut self, pos: Vec3, color: [f32; 3]) -> Entity {
+        let id = self.next_id;
+        self.next_id += 1;
+        Entity {
+            id,
+            name: format!("Object {id}"),
+            pos,
+            rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
+            color,
+            kind: ShapeKind::Cube,
+        }
+    }
+
     fn add_cube(&mut self) {
-        let (x, z) = grid_slot(self.cubes.len());
-        self.cubes.push(Cube {
-            pos: Vec3::new(x, CUBE_HALF, z),
-            color: CUBE_BASE_COLOR,
-        });
+        let (x, z) = grid_slot(self.entities.len());
+        let e = self.new_entity(Vec3::new(x, CUBE_HALF, z), CUBE_BASE_COLOR);
+        self.entities.push(e);
         self.rebuild_cubes();
         self.record_history("Add cube");
     }
 
     fn rebuild_cubes(&mut self) {
-        if self.cubes.is_empty() {
+        if self.entities.is_empty() {
             self.cube_buffer = None;
             self.cube_vertex_count = 0;
             return;
         }
-        let verts = build_cube_vertices(&self.cubes, self.selected);
+        let verts = build_scene_vertices(&self.entities, self.selected);
         self.cube_vertex_count = verts.len() as u32;
         self.cube_buffer = Some(self.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -1595,9 +2434,15 @@ impl State {
         let origin = near;
         let dir = (far - near).normalize();
 
+        // Ray-test in each entity's local space (handles rotation + scale): the
+        // ray parameter `t` is preserved by the affine inverse, so it stays
+        // comparable across entities for picking the nearest.
         let mut best: Option<(usize, f32)> = None;
-        for (i, c) in self.cubes.iter().enumerate() {
-            if let Some(t) = ray_aabb(origin, dir, c.pos, CUBE_HALF) {
+        for (i, e) in self.entities.iter().enumerate() {
+            let inv = e.model_matrix().inverse();
+            let lo = inv.transform_point3(origin);
+            let ld = inv.transform_vector3(dir);
+            if let Some(t) = ray_aabb(lo, ld, Vec3::ZERO, CUBE_HALF) {
                 if best.map_or(true, |(_, bt)| t < bt) {
                     best = Some((i, t));
                 }
@@ -1612,24 +2457,195 @@ impl State {
         }
     }
 
+    /// Project the selected object's gizmo center + 3 axis tips into viewport
+    /// pixels (matching `cursor_pos`/`viewport_px` space). None if no selection.
+    fn gizmo_screen_points(&self) -> Option<((f32, f32), [(f32, f32); 3])> {
+        let i = self.selected?;
+        let obj = self.entities.get(i)?.pos;
+        let vp = self.current_view_proj();
+        let (vx, vy, vw, vh) = self.viewport_px();
+        let proj = |w: Vec3| -> Option<(f32, f32)> {
+            let clip = vp * w.extend(1.0);
+            if clip.w <= 0.001 {
+                return None;
+            }
+            let ndc = clip.truncate() / clip.w;
+            Some((
+                vx + (ndc.x * 0.5 + 0.5) * vw,
+                vy + (1.0 - ndc.y) * 0.5 * vh,
+            ))
+        };
+        let center = proj(obj)?;
+        let tips = [
+            proj(obj + Vec3::X * GIZMO_AXIS_LEN)?,
+            proj(obj + Vec3::Y * GIZMO_AXIS_LEN)?,
+            proj(obj + Vec3::Z * GIZMO_AXIS_LEN)?,
+        ];
+        Some((center, tips))
+    }
+
+    /// Is the cursor over the on-screen gizmo toolbar? (toolbar rect is in egui
+    /// points; the cursor is physical px.)
+    fn pointer_on_toolbar(&self) -> bool {
+        let Some(tr) = self.toolbar_rect else {
+            return false;
+        };
+        let ppp = self.window.scale_factor() as f32;
+        let (cx, cy) = self.cursor_pos;
+        cx >= tr.left() * ppp
+            && cx <= tr.right() * ppp
+            && cy >= tr.top() * ppp
+            && cy <= tr.bottom() * ppp
+    }
+
+    /// Project a single world point into viewport pixels (None if behind camera).
+    fn project_world(&self, w: Vec3) -> Option<(f32, f32)> {
+        let clip = self.current_view_proj() * w.extend(1.0);
+        if clip.w <= 0.001 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        let (vx, vy, vw, vh) = self.viewport_px();
+        Some((vx + (ndc.x * 0.5 + 0.5) * vw, vy + (1.0 - ndc.y) * 0.5 * vh))
+    }
+
+    /// Which gizmo handle (translate-axis tip or rotate ring) is under `cursor`.
+    fn gizmo_handle_hit(&self, cursor: (f32, f32)) -> Option<usize> {
+        let i = self.selected?;
+        let obj = self.entities.get(i)?.pos;
+        let ppp = self.window.scale_factor() as f32;
+        let mut best: Option<(usize, f32)> = None;
+        match self.gizmo_mode {
+            GizmoMode::Translate | GizmoMode::Scale => {
+                let radius = 16.0 * ppp;
+                for (ai, dir) in [Vec3::X, Vec3::Y, Vec3::Z].iter().enumerate() {
+                    if let Some(t) = self.project_world(obj + *dir * GIZMO_AXIS_LEN) {
+                        let d = ((t.0 - cursor.0).powi(2) + (t.1 - cursor.1).powi(2)).sqrt();
+                        if d <= radius && best.map_or(true, |(_, bd)| d < bd) {
+                            best = Some((ai, d));
+                        }
+                    }
+                }
+            }
+            GizmoMode::Rotate => {
+                // Hit-test the ball handle on each ring.
+                let rot = self.entities[i].rotation;
+                let radius = 22.0 * ppp;
+                for axis in 0..3 {
+                    if let Some(b) = self.project_world(rotate_ball_world(axis, obj, rot)) {
+                        let d = ((b.0 - cursor.0).powi(2) + (b.1 - cursor.1).powi(2)).sqrt();
+                        if d <= radius && best.map_or(true, |(_, bd)| d < bd) {
+                            best = Some((axis, d));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Apply a mouse motion of (dx, dy) physical px to the selected object via
+    /// the active gizmo: translate along axis `ax`, or rotate about it.
+    fn gizmo_drag_motion(&mut self, ax: usize, dx: f32, dy: f32) {
+        let Some(i) = self.selected else { return };
+        if i >= self.entities.len() {
+            return;
+        }
+        match self.gizmo_mode {
+            GizmoMode::Translate => {
+                let Some((center, tips)) = self.gizmo_screen_points() else {
+                    return;
+                };
+                let (sx, sy) = (tips[ax].0 - center.0, tips[ax].1 - center.1);
+                let slen = (sx * sx + sy * sy).sqrt().max(1.0);
+                let along = (dx * sx + dy * sy) / slen;
+                let dir = [Vec3::X, Vec3::Y, Vec3::Z][ax];
+                self.entities[i].pos += dir * (along * GIZMO_AXIS_LEN / slen);
+            }
+            GizmoMode::Rotate => {
+                // Rotate about the object's LOCAL axis so its (rigidly-attached)
+                // ball follows the cursor along its tilted ring; store back as euler.
+                let q = obj_quat(self.entities[i].rotation);
+                let (ul, vl) = ring_basis(ax);
+                let (u, v) = (q * ul, q * vl);
+                let ballvec = q * (ROT_ANCHOR[ax] * GIZMO_AXIS_LEN);
+                let alpha = ballvec.dot(v).atan2(ballvec.dot(u));
+                let Some(phi) = self.cursor_ring_angle(ax) else {
+                    return;
+                };
+                let local_axis = [Vec3::X, Vec3::Y, Vec3::Z][ax];
+                let qnew = q * Quat::from_axis_angle(local_axis, phi - alpha);
+                let (ex, ey, ez) = qnew.to_euler(EulerRot::XYZ);
+                self.entities[i].rotation =
+                    Vec3::new(ex.to_degrees(), ey.to_degrees(), ez.to_degrees());
+            }
+            GizmoMode::Scale => {
+                // Uniform scale from how far the cursor is from the object center
+                // relative to the grab distance, clamped to 10%–200%.
+                let Some((center, _)) = self.gizmo_screen_points() else {
+                    return;
+                };
+                let (cx, cy) = self.cursor_pos;
+                let dist = ((cx - center.0).powi(2) + (cy - center.1).powi(2)).sqrt().max(1.0);
+                let factor = dist / self.gizmo_scale_dist0.max(1.0);
+                let s = (self.gizmo_scale_start * factor).clamp(SCALE_MIN, SCALE_MAX);
+                self.entities[i].scale = Vec3::splat(s);
+            }
+        }
+        self.project_dirty = true;
+        self.rebuild_cubes();
+    }
+
+    /// Angle (radians) of the cursor's ray-vs-ring-plane hit point, measured in
+    /// the object-tilted ring basis — i.e. where on `axis`'s ring the cursor points.
+    fn cursor_ring_angle(&self, axis: usize) -> Option<f32> {
+        let i = self.selected?;
+        let e = self.entities.get(i)?;
+        let obj = e.pos;
+        let q = obj_quat(e.rotation);
+        let (ul, vl) = ring_basis(axis);
+        let (u, v) = (q * ul, q * vl);
+        let normal = q * [Vec3::X, Vec3::Y, Vec3::Z][axis];
+        let (vx, vy, vw, vh) = self.viewport_px();
+        let (cx, cy) = self.cursor_pos;
+        let ndc_x = ((cx - vx) / vw) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((cy - vy) / vh) * 2.0;
+        let inv = self.current_view_proj().inverse();
+        let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        let origin = near.truncate() / near.w;
+        let dir = (far.truncate() / far.w - origin).normalize();
+        let denom = dir.dot(normal);
+        if denom.abs() < 1e-5 {
+            return None;
+        }
+        let t = (obj - origin).dot(normal) / denom;
+        if t < 0.0 {
+            return None;
+        }
+        let local = (origin + dir * t) - obj;
+        Some(local.dot(v).atan2(local.dot(u)))
+    }
+
     fn remove_selected(&mut self) {
         if let Some(i) = self.selected {
-            if i < self.cubes.len() {
-                self.cubes.remove(i);
+            if i < self.entities.len() {
+                self.entities.remove(i);
             }
             self.selected = None;
             self.rebuild_cubes();
-            self.record_history("Remove cube");
-            println!("Removed cube; {} remain", self.cubes.len());
+            self.record_history("Remove object");
+            println!("Removed object; {} remain", self.entities.len());
         }
     }
 
     /// Push a snapshot of the current scene onto the history (dropping any redo tail).
     fn record_history(&mut self, label: impl Into<String>) {
+        self.project_dirty = true;
         self.history.truncate(self.history_cursor + 1);
         self.history.push(HistoryEntry {
             label: label.into(),
-            cubes: self.cubes.clone(),
+            entities: self.entities.clone(),
             selected: self.selected,
         });
         const MAX_HISTORY: usize = 100;
@@ -1657,7 +2673,7 @@ impl State {
     /// Restore the scene to the snapshot at the current history cursor.
     fn restore_history(&mut self) {
         let entry = self.history[self.history_cursor].clone();
-        self.cubes = entry.cubes;
+        self.entities = entry.entities;
         self.selected = entry.selected;
         self.rebuild_cubes();
     }
@@ -1670,7 +2686,7 @@ impl State {
         Project {
             format_version: PROJECT_FORMAT_VERSION,
             engine_version: CO_VERSION.to_string(),
-            scene: self.cubes.clone(),
+            scene: self.entities.clone(),
             theme: self.ui.theme,
             dark_mode: self.ui.dark_mode,
             controls: self.controls,
@@ -1692,8 +2708,18 @@ impl State {
     /// Replace the live engine state with a loaded project, rebuilding GPU
     /// buffers and resetting the undo history to the loaded scene as baseline.
     fn apply_project(&mut self, p: Project) {
-        self.cubes = p.scene;
+        self.entities = p.scene;
+        // Normalize ids/names so old projects (ids default to 0) and any
+        // duplicates get unique, stable ids; reset the id counter past them.
+        for (i, e) in self.entities.iter_mut().enumerate() {
+            e.id = i as u32 + 1;
+            if e.name.trim().is_empty() {
+                e.name = format!("Object {}", e.id);
+            }
+        }
+        self.next_id = self.entities.len() as u32 + 1;
         self.selected = None;
+        self.project_dirty = false;
         self.rebuild_cubes();
 
         self.ui.theme = p.theme;
@@ -1709,7 +2735,7 @@ impl State {
         // The loaded scene becomes the new history baseline (undo can't go past it).
         self.history = vec![HistoryEntry {
             label: "Opened project".to_string(),
-            cubes: self.cubes.clone(),
+            entities: self.entities.clone(),
             selected: None,
         }];
         self.history_cursor = 0;
@@ -1757,6 +2783,7 @@ impl State {
         match self.write_project(dir) {
             Ok(()) => {
                 self.project_path = Some(dir.to_path_buf());
+                self.project_dirty = false;
                 self.ui.project_status = Some(format!("Saved to {}", dir.display()));
                 println!("Saved project to {}", dir.display());
                 self.update_global_config();
@@ -1821,13 +2848,14 @@ impl State {
         else {
             return;
         };
-        self.cubes.clear();
+        self.entities.clear();
+        self.next_id = 1;
         self.selected = None;
         self.rebuild_cubes();
         self.dock_state = build_dock_state();
         self.history = vec![HistoryEntry {
             label: "New project".to_string(),
-            cubes: Vec::new(),
+            entities: Vec::new(),
             selected: None,
         }];
         self.history_cursor = 0;
@@ -1881,6 +2909,60 @@ impl State {
         if std::mem::take(&mut self.ui.redo_requested) {
             self.history_redo();
         }
+
+        // Scene outliner (Logic tab) requests: select / delete / add.
+        if let Some(i) = self.ui.outliner_select.take() {
+            if i < self.entities.len() {
+                self.selected = Some(i);
+                self.rebuild_cubes();
+            }
+        }
+        if let Some(i) = self.ui.outliner_delete.take() {
+            if i < self.entities.len() {
+                self.entities.remove(i);
+                self.selected = match self.selected {
+                    Some(s) if s == i => None,
+                    Some(s) if s > i => Some(s - 1),
+                    other => other,
+                };
+                self.rebuild_cubes();
+                self.record_history("Delete object");
+            }
+        }
+        if std::mem::take(&mut self.ui.outliner_add) {
+            self.add_cube();
+        }
+
+        // Inspector edits: apply live to the selected entity; record one undo
+        // entry when the edit finishes (drag released / field committed).
+        if let Some(edited) = self.ui.inspector_apply.take() {
+            if let Some(i) = self.selected {
+                if i < self.entities.len() {
+                    self.entities[i] = edited;
+                    self.project_dirty = true;
+                    self.rebuild_cubes();
+                }
+            }
+        }
+        if std::mem::take(&mut self.ui.inspector_commit) {
+            self.record_history("Edit object");
+        }
+        if let Some(m) = self.ui.gizmo_mode_req.take() {
+            self.gizmo_mode = m;
+        }
+        if let Some(s) = self.ui.scale_req.take() {
+            if let Some(i) = self.selected {
+                if i < self.entities.len() {
+                    self.entities[i].scale = Vec3::splat(s.clamp(SCALE_MIN, SCALE_MAX));
+                    self.project_dirty = true;
+                    self.rebuild_cubes();
+                }
+            }
+        }
+        if std::mem::take(&mut self.ui.scale_commit) {
+            self.record_history("Scale object");
+        }
+
 
         // Collect the result of an in-flight async git operation, if it finished.
         let mut git_done: Option<String> = None;
@@ -1965,6 +3047,53 @@ impl State {
             }
         }
 
+        // Nudge the selected object with the held arrow/PageUp-Down/comma-period
+        // keys (forward = -Z; right = +X; up = +Y; rotation about Y).
+        if self.nudge.any() {
+            if let Some(i) = self.selected {
+                if i < self.entities.len() {
+                    // Deliberately slow — the keyboard is for fine precision (the
+                    // last 5%); the on-screen gizmos handle fast/bulk movement.
+                    // Holding Shift moves much faster.
+                    let fast = if self.shift_down { 16.0 } else { 1.0 };
+                    let mv = 0.5 * fast * dt; // units / second
+                    let rot = 8.0 * fast * dt; // degrees / second
+                    let e = &mut self.entities[i];
+                    if self.nudge.fwd {
+                        e.pos.z -= mv;
+                    }
+                    if self.nudge.back {
+                        e.pos.z += mv;
+                    }
+                    if self.nudge.left {
+                        e.pos.x -= mv;
+                    }
+                    if self.nudge.right {
+                        e.pos.x += mv;
+                    }
+                    if self.nudge.up {
+                        e.pos.y += mv;
+                    }
+                    if self.nudge.down {
+                        e.pos.y -= mv;
+                    }
+                    if self.nudge.rot_left {
+                        e.rotation.y += rot;
+                    }
+                    if self.nudge.rot_right {
+                        e.rotation.y -= rot;
+                    }
+                    self.rebuild_cubes();
+                    self.project_dirty = true;
+                    self.nudging = true;
+                }
+            }
+        } else if self.nudging {
+            // Nudging just stopped — record one undo entry for the whole move.
+            self.nudging = false;
+            self.record_history("Move object");
+        }
+
         // Drain agent output (text + scene commands) since last frame.
         let mut deltas: Vec<String> = Vec::new();
         let mut commands: Vec<SceneCommand> = Vec::new();
@@ -2007,21 +3136,19 @@ impl State {
             for cmd in commands {
                 match cmd {
                     SceneCommand::Add { x, z, color } => {
-                        self.cubes.push(Cube {
-                            pos: Vec3::new(x, CUBE_HALF, z),
-                            color,
-                        });
+                        let e = self.new_entity(Vec3::new(x, CUBE_HALF, z), color);
+                        self.entities.push(e);
                         self.record_history("CoE-AI: add cube");
                     }
                     SceneCommand::SetColor { index, color } => {
-                        if index < self.cubes.len() {
-                            self.cubes[index].color = color;
+                        if index < self.entities.len() {
+                            self.entities[index].color = color;
                             self.record_history("CoE-AI: recolor cube");
                         }
                     }
                     SceneCommand::Remove { index } => {
-                        if index < self.cubes.len() {
-                            self.cubes.remove(index);
+                        if index < self.entities.len() {
+                            self.entities.remove(index);
                             self.selected = match self.selected {
                                 Some(s) if s == index => None,
                                 Some(s) if s > index => Some(s - 1),
@@ -2031,12 +3158,12 @@ impl State {
                         }
                     }
                     SceneCommand::Select { index } => {
-                        if index < self.cubes.len() {
+                        if index < self.entities.len() {
                             self.selected = Some(index);
                         }
                     }
                     SceneCommand::Clear => {
-                        self.cubes.clear();
+                        self.entities.clear();
                         self.selected = None;
                         self.record_history("CoE-AI: clear scene");
                     }
@@ -2147,9 +3274,11 @@ impl State {
                 pass.set_scissor_rect(vx as u32, vy as u32, vw as u32, vh as u32);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-                pass.set_pipeline(&self.grid_pipeline);
-                pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
-                pass.draw(0..self.grid_vertex_count, 0..1);
+                if self.show_grid {
+                    pass.set_pipeline(&self.grid_pipeline);
+                    pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
+                    pass.draw(0..self.grid_vertex_count, 0..1);
+                }
 
                 if let Some(cube_buffer) = &self.cube_buffer {
                     pass.set_pipeline(&self.cube_pipeline);
@@ -2167,10 +3296,16 @@ impl State {
         let splash = self.splash_texture.as_ref();
         let loading = self.loading_until.is_some();
         let scene = SceneSnapshot {
-            cubes: self.cubes.iter().map(|c| (c.pos, c.color)).collect(),
+            cubes: self.entities.iter().map(|e| (e.pos, e.color)).collect(),
             selected: self.selected,
         };
+        let outliner: Vec<String> = self.entities.iter().map(|e| e.name.clone()).collect();
+        let inspector = self.selected.and_then(|i| self.entities.get(i).cloned());
+        let view_proj = self.current_view_proj();
+        let gizmo_axis = self.gizmo_drag;
+        let gizmo_mode = self.gizmo_mode;
         let project_path = self.project_path.clone();
+        let project_dirty = self.project_dirty;
         let file_cache = &mut self.file_cache;
         let terminal = &mut self.terminal;
         let git = &mut self.git;
@@ -2183,6 +3318,7 @@ impl State {
         let history_cursor = self.history_cursor;
         let dock_state = &mut self.dock_state;
         let mut captured_scene_rect: Option<egui::Rect> = None;
+        let mut captured_toolbar_rect: Option<egui::Rect> = None;
         let full_output = ctx.run(raw_input, |c| {
             build_ui(
                 c,
@@ -2192,11 +3328,17 @@ impl State {
                 logo,
                 splash,
                 loading,
+                view_proj,
+                gizmo_axis,
+                gizmo_mode,
                 &scene,
+                &outliner,
+                inspector.as_ref(),
                 controls,
                 history,
                 history_cursor,
                 project_path.as_deref(),
+                project_dirty,
                 file_cache,
                 terminal,
                 git,
@@ -2204,9 +3346,11 @@ impl State {
                 focus_restore,
                 dock_state,
                 &mut captured_scene_rect,
+                &mut captured_toolbar_rect,
             )
         });
         self.scene_rect = captured_scene_rect;
+        self.toolbar_rect = captured_toolbar_rect;
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -2378,6 +3522,7 @@ impl ApplicationHandler for App {
                             state.ui.rebinding = None;
                         } else {
                             state.controls.set(action, code);
+                            state.project_dirty = true;
                             state.ui.rebinding = None;
                         }
                     }
@@ -2458,6 +3603,28 @@ impl ApplicationHandler for App {
                         // Non-Tab camera key (Tab is handled before egui above).
                         state.toggle_mode();
                     }
+
+                    // WoW-Housing-style nudge keys for the selected object, plus the
+                    // grid toggle (these are fixed, not remappable for now).
+                    match code {
+                        KeyCode::ArrowUp => state.nudge.fwd = pressed,
+                        KeyCode::ArrowDown => state.nudge.back = pressed,
+                        KeyCode::ArrowLeft => state.nudge.left = pressed,
+                        KeyCode::ArrowRight => state.nudge.right = pressed,
+                        KeyCode::PageUp => state.nudge.up = pressed,
+                        KeyCode::PageDown => state.nudge.down = pressed,
+                        KeyCode::Comma => state.nudge.rot_left = pressed,
+                        KeyCode::Period => state.nudge.rot_right = pressed,
+                        KeyCode::KeyX if first_press => state.show_grid = !state.show_grid,
+                        KeyCode::KeyR if first_press => {
+                            state.gizmo_mode = match state.gizmo_mode {
+                                GizmoMode::Translate => GizmoMode::Rotate,
+                                GizmoMode::Rotate => GizmoMode::Scale,
+                                GizmoMode::Scale => GizmoMode::Translate,
+                            };
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -2467,22 +3634,52 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let pressed = btn_state == ElementState::Pressed;
-                // Only START a 3D interaction when the press lands inside the viewport.
-                // Releases always run so the drag flags can't get stuck.
-                if pressed && !in_scene {
-                    return;
-                }
                 match button {
                     MouseButton::Left => {
-                        state.mouse_left_down = pressed;
                         if pressed {
-                            state.left_drag_dist = 0.0;
-                        } else if state.left_drag_dist < 5.0 {
-                            let cursor = state.cursor_pos;
-                            state.pick(cursor);
+                            if in_scene && !state.pointer_on_toolbar() {
+                                // A gizmo handle takes priority; otherwise orbit/select.
+                                if let Some(ax) = state.gizmo_handle_hit(state.cursor_pos) {
+                                    state.gizmo_drag = Some(ax);
+                                    // Capture scale-grab state so scaling is relative.
+                                    if state.gizmo_mode == GizmoMode::Scale {
+                                        if let (Some(i), Some((center, _))) =
+                                            (state.selected, state.gizmo_screen_points())
+                                        {
+                                            let (cx, cy) = state.cursor_pos;
+                                            state.gizmo_scale_dist0 = ((cx - center.0).powi(2)
+                                                + (cy - center.1).powi(2))
+                                            .sqrt()
+                                            .max(1.0);
+                                            state.gizmo_scale_start = state.entities[i].scale.x;
+                                        }
+                                    }
+                                } else {
+                                    state.mouse_left_down = true;
+                                    state.left_drag_dist = 0.0;
+                                }
+                            }
+                        } else if state.gizmo_drag.take().is_some() {
+                            // Finished a gizmo drag — record one undo entry.
+                            state.record_history("Move object");
+                        } else {
+                            // Pick only if the drag started as a real scene click.
+                            let was_down = std::mem::take(&mut state.mouse_left_down);
+                            if was_down && state.left_drag_dist < 5.0 {
+                                let cursor = state.cursor_pos;
+                                state.pick(cursor);
+                            }
                         }
                     }
-                    MouseButton::Right => state.mouse_right_down = pressed,
+                    MouseButton::Right => {
+                        if pressed {
+                            if in_scene {
+                                state.mouse_right_down = true;
+                            }
+                        } else {
+                            state.mouse_right_down = false;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2501,7 +3698,15 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::Focused(false) => state.keys = Keys::default(),
+            WindowEvent::Focused(false) => {
+                state.keys = Keys::default();
+                state.nudge = NudgeKeys::default();
+                state.shift_down = false;
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                state.shift_down = mods.state().shift_key();
+            }
 
             _ => {}
         }
@@ -2519,6 +3724,12 @@ impl ApplicationHandler for App {
 
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             let (dx, dy) = (dx as f32, dy as f32);
+
+            // Dragging a gizmo axis takes over the mouse (no camera movement).
+            if let Some(ax) = state.gizmo_drag {
+                state.gizmo_drag_motion(ax, dx, dy);
+                return;
+            }
 
             if state.mouse_left_down {
                 state.left_drag_dist += dx.abs() + dy.abs();

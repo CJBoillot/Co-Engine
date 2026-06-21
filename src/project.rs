@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::DockTab;
 use crate::controls::Controls;
-use crate::mesh::Cube;
+use crate::mesh::Entity;
 use crate::terminal::Shell;
 use crate::theme::Theme;
 
@@ -27,8 +27,8 @@ pub(crate) struct Project {
     pub(crate) format_version: u32,
     /// The CoEngine (CoSemVer) build that last wrote this file — for diagnostics.
     pub(crate) engine_version: String,
-    /// The 3D scene: every placed cube.
-    pub(crate) scene: Vec<Cube>,
+    /// The 3D scene: every placed entity.
+    pub(crate) scene: Vec<Entity>,
     /// UI theme preset.
     pub(crate) theme: Theme,
     /// Dark vs. light mode for the chosen theme.

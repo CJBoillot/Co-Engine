@@ -1,7 +1,7 @@
 //! Geometry: vertices, cubes, the grid, and ray/AABB picking math.
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const CUBE_HALF: f32 = 0.5;
@@ -27,11 +27,50 @@ impl Vertex {
     }
 }
 
-/// A cube in the scene: a position plus a base color (shaded per-face at build).
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct Cube {
+/// The shape an entity renders as. Only `Cube` for now; more primitives (and
+/// loaded meshes / 2D sprites) slot in here later without touching the model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub(crate) enum ShapeKind {
+    #[default]
+    Cube,
+}
+
+fn vec3_one() -> Vec3 {
+    Vec3::ONE
+}
+
+/// A scene object: a stable id + name + a full transform (position, rotation in
+/// euler degrees, scale) + color + shape. Dimension-agnostic — a future 2D scene
+/// reuses this same model (a sprite is just another `ShapeKind` with z fixed).
+///
+/// `pos`/`color` keep their old field names so pre-v0.0.16 `project.json` files
+/// (which serialized cubes as `{pos, color}`) still load; the new fields default.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Entity {
+    #[serde(default)]
+    pub(crate) id: u32,
+    #[serde(default)]
+    pub(crate) name: String,
     pub(crate) pos: Vec3,
+    #[serde(default)]
+    pub(crate) rotation: Vec3,
+    #[serde(default = "vec3_one")]
+    pub(crate) scale: Vec3,
     pub(crate) color: [f32; 3],
+    #[serde(default)]
+    pub(crate) kind: ShapeKind,
+}
+
+impl Entity {
+    /// The world transform (T · R · S) used to place this entity's geometry.
+    pub(crate) fn model_matrix(&self) -> Mat4 {
+        let r = self.rotation * (std::f32::consts::PI / 180.0);
+        Mat4::from_scale_rotation_translation(
+            self.scale,
+            Quat::from_euler(EulerRot::XYZ, r.x, r.y, r.z),
+            self.pos,
+        )
+    }
 }
 
 /// Half-grid placement: the Nth cube's (x, z) on the ground grid.
@@ -133,30 +172,27 @@ pub(crate) fn unit_cube() -> Vec<Vertex> {
     v
 }
 
-pub(crate) fn build_cube_vertices(cubes: &[Cube], selected: Option<usize>) -> Vec<Vertex> {
+/// Build the scene's triangle vertices: each entity's unit cube transformed by
+/// its model matrix (position/rotation/scale) and tinted by its color, with the
+/// selected entity glowing cobalt.
+pub(crate) fn build_scene_vertices(entities: &[Entity], selected: Option<usize>) -> Vec<Vertex> {
     let base = unit_cube();
-    let mut out = Vec::with_capacity(cubes.len() * base.len());
+    let mut out = Vec::with_capacity(entities.len() * base.len());
 
-    for (i, cube) in cubes.iter().enumerate() {
+    for (i, e) in entities.iter().enumerate() {
         let highlight = Some(i) == selected;
+        let model = e.model_matrix();
         for v in &base {
             let shade = v.color[0]; // per-face grayscale brightness
             let color = if highlight {
-                // Selected cubes glow cobalt (the engine identity color).
+                // The selected entity glows cobalt (the engine identity color).
                 [shade * 0.25, shade * 0.55, shade * 1.00]
             } else {
-                [
-                    shade * cube.color[0],
-                    shade * cube.color[1],
-                    shade * cube.color[2],
-                ]
+                [shade * e.color[0], shade * e.color[1], shade * e.color[2]]
             };
+            let p = model.transform_point3(Vec3::from(v.position));
             out.push(Vertex {
-                position: [
-                    v.position[0] + cube.pos.x,
-                    v.position[1] + cube.pos.y,
-                    v.position[2] + cube.pos.z,
-                ],
+                position: [p.x, p.y, p.z],
                 color,
             });
         }
