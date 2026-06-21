@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.17";
+pub(crate) const CO_VERSION: &str = "0.0.18";
 
 mod ai;
 use ai::*;
@@ -87,6 +87,8 @@ pub(crate) enum DockTab {
     Terminal,
     /// Git / Source Control panel.
     Git,
+    /// Project-wide search panel.
+    Search,
     /// A file viewer opened from the Explorer; the tab is titled by file name and
     /// shows the file's text/code, or the image if it's an image.
     File(PathBuf),
@@ -149,6 +151,14 @@ struct UiState {
     /// confirmed or canceled. `fs_prompt_error` shows a failed op's message.
     fs_prompt: Option<FsPrompt>,
     fs_prompt_error: Option<String>,
+    /// Caret (line, col) of the focused file editor, for the status bar. Captured
+    /// during the dock pass and shown on the next frame (one-frame lag).
+    editor_cursor: Option<(usize, usize)>,
+    /// In-file Find/Replace bar state + a one-shot "go to this match" range.
+    find: FindState,
+    find_goto: Option<(usize, usize)>,
+    /// Project-wide Search tab state.
+    search: SearchUi,
 }
 
 impl Default for UiState {
@@ -183,6 +193,10 @@ impl Default for UiState {
             scale_commit: false,
             fs_prompt: None,
             fs_prompt_error: None,
+            editor_cursor: None,
+            find: FindState::default(),
+            find_goto: None,
+            search: SearchUi::default(),
         }
     }
 }
@@ -198,6 +212,7 @@ fn dock_tab_label(tab: &DockTab) -> String {
         DockTab::Log => "Log".to_string(),
         DockTab::Terminal => "Terminal".to_string(),
         DockTab::Git => "Git".to_string(),
+        DockTab::Search => "Search".to_string(),
         DockTab::File(p) => p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -845,6 +860,16 @@ struct EngineTabs<'a> {
     inspector: Option<Entity>,
     inspector_apply: &'a mut Option<Entity>,
     inspector_commit: &'a mut bool,
+    /// Out-param: caret (line, col) of the focused file editor (for the status bar).
+    cursor_out: &'a mut Option<(usize, usize)>,
+    /// Project-wide Search tab state.
+    search: &'a mut SearchUi,
+    /// The active focused file (so only its editor consumes a Find "go to match").
+    active_file: Option<PathBuf>,
+    /// A Find match to scroll/select in the active editor (one-shot).
+    find_goto: &'a mut Option<(usize, usize)>,
+    /// The live Find query to highlight in the active editor (None = bar closed).
+    find_query: Option<String>,
 }
 
 impl TabViewer for EngineTabs<'_> {
@@ -930,13 +955,26 @@ impl TabViewer for EngineTabs<'_> {
             DockTab::Git => {
                 git_tab_ui(ui, self.git, self.project_root.as_deref());
             }
+            DockTab::Search => {
+                search_tab(ui, self.search, self.project_root.as_deref(), self.open_file_req);
+            }
             DockTab::File(path) => {
                 let lang = language_for(path);
+                // Only the active file consumes a pending Find "go to match" and
+                // shows live match highlights.
+                let is_active = self.active_file.as_deref() == Some(path.as_path());
+                let mut none = None;
+                let goto = if is_active { &mut *self.find_goto } else { &mut none };
+                let find_query = if is_active {
+                    self.find_query.as_deref().unwrap_or("")
+                } else {
+                    ""
+                };
                 let view = self
                     .file_cache
                     .entry(path.clone())
                     .or_insert_with(|| load_file_view(ui.ctx(), path.as_path()));
-                file_view_ui(ui, view, lang);
+                file_view_ui(ui, view, lang, self.cursor_out, goto, find_query);
             }
         }
     }
@@ -1131,12 +1169,17 @@ fn build_ui(
             });
     }
 
+    // Guards the click-away close so the very click that opens a popup this frame
+    // doesn't immediately close it again.
+    let mut popup_just_opened = false;
+
     // Top bar: Menu + identity + tabs, all on one row.
     egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             if ui.button("Menu").clicked() {
-                ui_state.menu_open = true;
+                ui_state.menu_open = !ui_state.menu_open;
+                popup_just_opened = true;
             }
             ui.separator();
             ui.label(egui::RichText::new("CoEngine").strong().color(ACCENT_GOLD));
@@ -1152,6 +1195,7 @@ fn build_ui(
                 (DockTab::Log, "Log"),
                 (DockTab::Terminal, "Terminal"),
                 (DockTab::Git, "Git"),
+                (DockTab::Search, "Search"),
             ];
             // (Reopen buttons are hidden during Focus mode — the minimized tabs
             // are shown by the Focus row below instead.)
@@ -1257,12 +1301,49 @@ fn build_ui(
             ui.label(egui::RichText::new("Tools").small());
         });
     });
+
+    // Bottom status bar: git branch (left); caret position, active-file language,
+    // and unsaved-file count (right). The caret is last frame's value (see the
+    // dock pass below) — imperceptible lag. No error/warning count yet: that needs
+    // the diagnostics/LSP layer, which is deferred until the scripting lang is set.
+    let unsaved = file_cache.values().filter(|v| v.is_dirty()).count();
+    let lang = active_file.as_ref().map(|p| language_for(p));
+    let branch = project_path.and_then(current_branch);
+    let cursor = ui_state.editor_cursor;
+    egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            match &branch {
+                Some(b) => {
+                    ui.label("Branch:");
+                    ui.label(egui::RichText::new(b).color(ACCENT_GOLD));
+                }
+                None => {
+                    ui.label(egui::RichText::new("No repo").weak());
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if let Some((line, col)) = cursor {
+                    ui.label(format!("Ln {line}, Col {col}"));
+                    ui.separator();
+                }
+                if let Some(l) = lang {
+                    ui.label(l.to_uppercase());
+                    ui.separator();
+                }
+                let dot = if unsaved > 0 { "● " } else { "" };
+                ui.label(format!("{dot}{unsaved} unsaved"));
+            });
+        });
+    });
+
     if do_save_project {
         ui_state.save_requested = true;
     }
     if do_save && active_dirty {
-        if let Some(p) = active_file {
-            match save_file(&p, file_cache) {
+        if let Some(p) = active_file.as_ref() {
+            match save_file(p, file_cache) {
                 Ok(()) => println!("Saved {}", p.display()),
                 Err(e) => eprintln!("Save failed: {e}"),
             }
@@ -1281,6 +1362,32 @@ fn build_ui(
         }
     }
 
+    // In-file Find/Replace bar (Ctrl+F), for the active text file. Runs before the
+    // dock pass so its edits land before the viewer borrows `file_cache`; sets
+    // `find_goto`, which the active editor consumes during the dock pass.
+    let active_text = active_file
+        .as_ref()
+        .filter(|p| matches!(file_cache.get(*p), Some(FileView::Text { .. })))
+        .cloned();
+    if active_text.is_some()
+        && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F))
+    {
+        ui_state.find.open = true;
+        ui_state.find.focus_query = true;
+    }
+    if ui_state.find.open {
+        match active_text {
+            Some(path) => find_bar(
+                ctx,
+                &mut ui_state.find,
+                &mut ui_state.find_goto,
+                &path,
+                file_cache,
+            ),
+            None => ui_state.find.open = false,
+        }
+    }
+
     // The dockable workspace fills the central area. Each tab can be dragged into a
     // column or a full-screen tab and resized; the 3D Scene tab is the live viewport.
     let mut open_file_req: Option<PathBuf> = None;
@@ -1288,6 +1395,8 @@ fn build_ui(
     let mut fs_move_req: Option<(PathBuf, PathBuf)> = None;
     let mut focus_req: Option<DockTab> = None;
     let mut close_req: Option<DockTab> = None;
+    // Recomputed each frame from whichever file editor has focus.
+    ui_state.editor_cursor = None;
     {
         let mut viewer = EngineTabs {
             chat,
@@ -1315,6 +1424,15 @@ fn build_ui(
             inspector: inspector.cloned(),
             inspector_apply: &mut ui_state.inspector_apply,
             inspector_commit: &mut ui_state.inspector_commit,
+            cursor_out: &mut ui_state.editor_cursor,
+            search: &mut ui_state.search,
+            active_file: active_file.clone(),
+            find_goto: &mut ui_state.find_goto,
+            find_query: if ui_state.find.open {
+                Some(ui_state.find.query.clone())
+            } else {
+                None
+            },
         };
         DockArea::new(dock_state)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -1562,7 +1680,7 @@ fn build_ui(
 
     // Menu window (opened by Esc or the Menu button).
     if ui_state.menu_open {
-        egui::Window::new("menu")
+        let resp = egui::Window::new("menu")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -1635,6 +1753,7 @@ fn build_ui(
                 {
                     ui_state.settings_open = true;
                     ui_state.menu_open = false;
+                    popup_just_opened = true;
                 }
                 ui.add_space(6.0);
                 if ui
@@ -1654,11 +1773,14 @@ fn build_ui(
                 }
                 ui.add_space(8.0);
             });
+        if !popup_just_opened && clicked_outside(ctx, &resp) {
+            ui_state.menu_open = false;
+        }
     }
 
     // Settings window (modal-ish).
     if ui_state.settings_open {
-        egui::Window::new("Settings")
+        let resp = egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
             .movable(false)
@@ -1780,12 +1902,16 @@ fn build_ui(
                     ui_state.rebinding = None;
                 }
             });
+        // Don't click-away close while rebinding a key (the next click is the bind).
+        if !popup_just_opened && ui_state.rebinding.is_none() && clicked_outside(ctx, &resp) {
+            ui_state.settings_open = false;
+        }
     }
 
     // CoE-AI command approval (confirm-each): the agent's worker thread is blocked
     // until the user approves (runs the command) or denies it.
     if pending_command.is_some() {
-        egui::Window::new("cmd_confirm")
+        let resp = egui::Window::new("cmd_confirm")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -1838,7 +1964,26 @@ fn build_ui(
                 });
                 ui.add_space(8.0);
             });
+        // Click-away denies (safe default: nothing runs).
+        if clicked_outside(ctx, &resp) {
+            if let Some(pc) = pending_command.take() {
+                let _ = pc
+                    .reply
+                    .send("The user denied running this command.".to_string());
+            }
+        }
     }
+}
+
+/// True when the user presses the primary mouse button this frame outside the
+/// given popup window — the shared "click-away closes it" rule for modals/popups.
+fn clicked_outside<R>(ctx: &egui::Context, inner: &Option<egui::InnerResponse<R>>) -> bool {
+    let Some(ir) = inner else { return false };
+    if !ctx.input(|i| i.pointer.primary_pressed()) {
+        return false;
+    }
+    ctx.input(|i| i.pointer.interact_pos())
+        .is_some_and(|p| !ir.response.rect.contains(p))
 }
 
 /// Open (or focus) a viewer tab for `path`, docked in the same leaf as Logic
@@ -1899,7 +2044,7 @@ fn service_fs_prompt(
         // own so the error isn't lost.
         if let Some(err) = ui_state.fs_prompt_error.clone() {
             let mut dismiss = false;
-            egui::Window::new("fs_error")
+            let resp = egui::Window::new("fs_error")
                 .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
@@ -1923,7 +2068,7 @@ fn service_fs_prompt(
                     }
                     ui.add_space(8.0);
                 });
-            if dismiss {
+            if dismiss || clicked_outside(ctx, &resp) {
                 ui_state.fs_prompt_error = None;
             }
         }
@@ -1932,7 +2077,7 @@ fn service_fs_prompt(
 
     let mut do_run = false;
     let mut do_cancel = false;
-    egui::Window::new("fs_prompt")
+    let resp = egui::Window::new("fs_prompt")
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
@@ -2004,7 +2149,7 @@ fn service_fs_prompt(
             }
         });
 
-    if do_cancel {
+    if do_cancel || clicked_outside(ctx, &resp) {
         ui_state.fs_prompt = None;
         ui_state.fs_prompt_error = None;
         return;
@@ -2037,6 +2182,101 @@ fn service_fs_prompt(
         }
         // Keep the modal open and show why it failed.
         Err(e) => ui_state.fs_prompt_error = Some(e),
+    }
+}
+
+/// The in-file Find/Replace bar (a small floating window). Operates directly on
+/// the active file's buffer; Prev/Next set `find_goto` (the editor scrolls/selects
+/// the match), Replace/All edit the buffer in place.
+fn find_bar(
+    ctx: &egui::Context,
+    find: &mut FindState,
+    find_goto: &mut Option<(usize, usize)>,
+    path: &Path,
+    file_cache: &mut HashMap<PathBuf, FileView>,
+) {
+    let Some(FileView::Text { buf, dirty }) = file_cache.get_mut(path) else {
+        find.open = false;
+        return;
+    };
+    let matches = find_matches(buf, &find.query);
+    let n = matches.len();
+    if find.current >= n {
+        find.current = 0;
+    }
+    let mut goto_idx: Option<usize> = None;
+    let mut did_replace = false;
+    let mut do_close = false;
+    let resp = egui::Window::new("find_bar")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0, 64.0))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let q = ui.add(
+                    egui::TextEdit::singleline(&mut find.query)
+                        .desired_width(170.0)
+                        .hint_text("Find"),
+                );
+                if find.focus_query {
+                    q.request_focus();
+                    find.focus_query = false;
+                }
+                let enter = q.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let count = if n > 0 {
+                    format!("{}/{}", find.current + 1, n)
+                } else if find.query.is_empty() {
+                    String::new()
+                } else {
+                    "0".to_string()
+                };
+                ui.label(egui::RichText::new(count).weak());
+                if ui.button("Prev").clicked() && n > 0 {
+                    find.current = (find.current + n - 1) % n;
+                    goto_idx = Some(find.current);
+                }
+                if (ui.button("Next").clicked() || enter) && n > 0 {
+                    find.current = (find.current + 1) % n;
+                    goto_idx = Some(find.current);
+                }
+                if ui.button("Close").clicked() {
+                    do_close = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut find.replace)
+                        .desired_width(170.0)
+                        .hint_text("Replace"),
+                );
+                if ui.button("Replace").clicked() && n > 0 {
+                    let (s, e) = matches[find.current.min(n - 1)];
+                    replace_char_range(buf, s, e, &find.replace);
+                    *dirty = true;
+                    did_replace = true;
+                }
+                if ui.button("All").clicked() && n > 0 {
+                    // Reverse order so earlier char indices stay valid as we splice.
+                    for &(s, e) in matches.iter().rev() {
+                        replace_char_range(buf, s, e, &find.replace);
+                    }
+                    *dirty = true;
+                    did_replace = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                do_close = true;
+            }
+        });
+    if let Some(i) = goto_idx {
+        *find_goto = Some(matches[i]);
+    }
+    if did_replace {
+        find.current = 0;
+    }
+    if do_close || clicked_outside(ctx, &resp) {
+        find.open = false;
     }
 }
 

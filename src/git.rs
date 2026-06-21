@@ -21,6 +21,21 @@ pub(crate) struct GitUi {
     pub(crate) seeded: bool,
 }
 
+/// The current branch from `.git/HEAD` (a cheap file read — no subprocess, safe
+/// to call each frame). Returns the branch name, a short commit hash in `()` when
+/// detached, or None if `root` isn't a git repo / HEAD is unreadable.
+pub(crate) fn current_branch(root: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        Some(branch.to_string())
+    } else if head.len() >= 7 {
+        Some(format!("({})", &head[..7]))
+    } else {
+        None
+    }
+}
+
 /// Run a program in `project`, capturing stdout+stderr as one string.
 pub(crate) fn run_tool(program: &str, project: &Path, args: &[&str]) -> String {
     match std::process::Command::new(program)
