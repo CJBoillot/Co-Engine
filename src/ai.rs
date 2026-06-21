@@ -119,6 +119,8 @@ pub(crate) struct ChatUi {
     pub(crate) effort_idx: usize,
     /// A prompt CoE-AI prepared for the user to paste to Claude (Desktop).
     pub(crate) pending_claude_prompt: Option<String>,
+    /// Whether the AI help modal (models & speed reference) is open.
+    pub(crate) help_open: bool,
 }
 
 /// Find the Anthropic API key: the ANTHROPIC_API_KEY environment variable first,
@@ -559,7 +561,152 @@ pub(crate) fn run_agent(req: AgentRequest, tx: Sender<StreamMsg>) {
 }
 
 /// Render the AI Chat content into a dock tab's Ui.
+/// The short model name for the compact button (drops the "— descriptor" tail).
+fn short_model_name(name: &str) -> &str {
+    name.split(" — ").next().unwrap_or(name)
+}
+
+/// The AI help modal: a reference page for each model + speed, with a relative
+/// token-cost rating and best-use guidance. A hub for more help pages later.
+fn ai_help_modal(ctx: &egui::Context, open: &mut bool) {
+    if !*open {
+        return;
+    }
+    // (short name, cost rating, best for, description) — parallel to MODELS.
+    const MODEL_HELP: &[(&str, &str, &str, &str)] = &[
+        (
+            "Haiku 4.5",
+            "$",
+            "Quick edits, simple scene ops, fast iteration",
+            "Fastest and cheapest. Great for small, well-defined tasks. No speed control — always runs fast.",
+        ),
+        (
+            "Sonnet 4.6",
+            "$$",
+            "Everyday building and most CoE-AI work",
+            "A strong balance of speed, quality, and cost. The sensible default for general use.",
+        ),
+        (
+            "Opus 4.8",
+            "$$$",
+            "Complex, multi-step reasoning and tricky problems",
+            "Most capable for hard tasks. Slower and pricier than Sonnet.",
+        ),
+        (
+            "Fable 5",
+            "$$$$",
+            "The most demanding creative / agentic work",
+            "Most powerful, with the highest cost and latency. Reach for it when nothing else suffices.",
+        ),
+    ];
+    const SPEED_HELP: &[(&str, &str)] = &[
+        ("Fast", "Least thinking, fewest tokens — quickest and cheapest."),
+        ("Balanced", "Moderate thinking. The default."),
+        ("High", "More thorough reasoning, more tokens."),
+        ("Max", "Maximum reasoning depth — slowest and most tokens."),
+    ];
+
+    let mut close = false;
+    egui::Window::new("ai_help")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.heading("AI Help");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(440.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Models").strong().color(ACCENT_GOLD));
+                    for (name, cost, best, desc) in MODEL_HELP {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(*name).strong());
+                            ui.label(egui::RichText::new(format!("token cost {cost}")).small().weak());
+                        });
+                        ui.label(egui::RichText::new(format!("Best for: {best}")).small());
+                        ui.label(egui::RichText::new(*desc).small().weak());
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Speed (thinking effort)")
+                            .strong()
+                            .color(ACCENT_GOLD),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Controls how long the model reasons before answering. \
+                             Applies to Sonnet, Opus, and Fable; Haiku always runs fast.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    for (name, desc) in SPEED_HELP {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(*name).strong());
+                            ui.label(egui::RichText::new(*desc).small().weak());
+                        });
+                    }
+                    ui.add_space(8.0);
+                });
+            ui.add_space(6.0);
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close = true;
+            }
+        });
+    if close {
+        *open = false;
+    }
+}
+
+/// One row in the model/speed picker menu: full-width, subtle hover, name on the
+/// left, a gold checkmark on the right when selected (Claude-style — no big bar).
+fn model_menu_row(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
+    let w = ui.available_width().max(180.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            crate::theme::RADIUS,
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.5),
+        ui.visuals().text_color(),
+    );
+    if selected {
+        ui.painter().text(
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            crate::theme::icon::CHECK,
+            egui::FontId::proportional(15.0),
+            crate::theme::ACCENT_GOLD,
+        );
+    }
+    resp.clicked()
+}
+
 pub(crate) fn chat_tab(ui: &mut egui::Ui, chat: &mut ChatUi, scene: &SceneSnapshot) {
+    ai_help_modal(ui.ctx(), &mut chat.help_open);
     egui::TopBottomPanel::top("chat_header").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("AI Chat");
@@ -617,23 +764,52 @@ pub(crate) fn chat_tab(ui: &mut egui::Ui, chat: &mut ChatUi, scene: &SceneSnapsh
 
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    // Model drop-up. Effort-capable models also show a Speed drop-up.
-                    egui::ComboBox::from_id_salt("model_select")
-                        .selected_text(MODELS[chat.model_idx].name)
-                        .show_ui(ui, |ui| {
-                            for (i, m) in MODELS.iter().enumerate() {
-                                ui.selectable_value(&mut chat.model_idx, i, m.name);
-                            }
-                        });
-                    if MODELS[chat.model_idx].effort {
-                        egui::ComboBox::from_id_salt("speed_select")
-                            .selected_text(EFFORTS[chat.effort_idx].0)
-                            .show_ui(ui, |ui| {
-                                for (i, e) in EFFORTS.iter().enumerate() {
-                                    ui.selectable_value(&mut chat.effort_idx, i, e.0);
+                    // Compact model picker (Claude-style): a small button showing just
+                    // the short model name; the menu lists models and, for effort-
+                    // capable models, the speed options + a Help entry.
+                    let label = format!(
+                        "{}  {}",
+                        short_model_name(MODELS[chat.model_idx].name),
+                        crate::theme::icon::CHEVRON_DOWN
+                    );
+                    ui.menu_button(egui::RichText::new(label).small(), |ui| {
+                        ui.set_min_width(236.0);
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new("Model").small().weak());
+                        for (i, m) in MODELS.iter().enumerate() {
+                            if model_menu_row(ui, m.name, i == chat.model_idx) {
+                                chat.model_idx = i;
+                                // No second choice (speed) → pick and close immediately.
+                                if !MODELS[i].effort {
+                                    ui.close_menu();
                                 }
-                            });
-                    }
+                            }
+                        }
+                        if MODELS[chat.model_idx].effort {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.label(egui::RichText::new("Speed").small().weak());
+                            for (i, e) in EFFORTS.iter().enumerate() {
+                                if model_menu_row(ui, e.0, i == chat.effort_idx) {
+                                    chat.effort_idx = i;
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                        ui.add_space(4.0);
+                        ui.separator();
+                        if model_menu_row(
+                            ui,
+                            &format!("{}  Help — models & speed", crate::theme::icon::INSPECTOR),
+                            false,
+                        ) {
+                            chat.help_open = true;
+                            ui.close_menu();
+                        }
+                        ui.add_space(2.0);
+                    })
+                    .response
+                    .on_hover_text("Model & speed");
 
                     // Send / Clear pinned to the right of the same row.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

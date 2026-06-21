@@ -38,7 +38,7 @@ impl OrbitCamera {
     pub(crate) fn orbit(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.005;
         self.yaw -= dx * SENSITIVITY;
-        self.pitch -= dy * SENSITIVITY;
+        self.pitch += dy * SENSITIVITY;
         let limit = std::f32::consts::FRAC_PI_2 - 0.01;
         self.pitch = self.pitch.clamp(-limit, limit);
     }
@@ -113,10 +113,6 @@ impl CameraUniform {
     }
 }
 
-pub(crate) fn title_for(mode: CameraMode) -> String {
-    let name = match mode {
-        CameraMode::Orbit => "Orbit",
-        CameraMode::Fly => "Fly",
-    };
-    format!("CoEngine v{CO_VERSION}   [{name}]")
+pub(crate) fn title_for(_mode: CameraMode) -> String {
+    format!("CoEngine v{CO_VERSION}")
 }

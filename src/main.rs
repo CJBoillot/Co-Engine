@@ -37,7 +37,7 @@ use winit::window::{Window, WindowId};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 mod theme;
-use theme::{ACCENT_GOLD, Theme, theme_visuals};
+use theme::{ACCENT_COBALT, ACCENT_GOLD, Theme, theme_visuals};
 
 mod mesh;
 use mesh::*;
@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.18";
+pub(crate) const CO_VERSION: &str = "0.0.19";
 
 mod ai;
 use ai::*;
@@ -89,6 +89,10 @@ pub(crate) enum DockTab {
     Git,
     /// Project-wide search panel.
     Search,
+    /// Asset catalog: a palette of 3D objects to drop into the scene.
+    Assets,
+    /// Resource monitor: memory / performance / scene stats for the designer.
+    Resources,
     /// A file viewer opened from the Explorer; the tab is titled by file name and
     /// shows the file's text/code, or the image if it's an image.
     File(PathBuf),
@@ -159,6 +163,12 @@ struct UiState {
     find_goto: Option<(usize, usize)>,
     /// Project-wide Search tab state.
     search: SearchUi,
+    /// Command palette (Ctrl+P): open flag, query text, and a focus request.
+    palette_open: bool,
+    palette_query: String,
+    palette_focus: bool,
+    /// Asset-catalog search box text.
+    asset_query: String,
 }
 
 impl Default for UiState {
@@ -197,6 +207,10 @@ impl Default for UiState {
             find: FindState::default(),
             find_goto: None,
             search: SearchUi::default(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_focus: false,
+            asset_query: String::new(),
         }
     }
 }
@@ -213,6 +227,8 @@ fn dock_tab_label(tab: &DockTab) -> String {
         DockTab::Terminal => "Terminal".to_string(),
         DockTab::Git => "Git".to_string(),
         DockTab::Search => "Search".to_string(),
+        DockTab::Assets => "Assets".to_string(),
+        DockTab::Resources => "Resources".to_string(),
         DockTab::File(p) => p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -870,6 +886,8 @@ struct EngineTabs<'a> {
     find_goto: &'a mut Option<(usize, usize)>,
     /// The live Find query to highlight in the active editor (None = bar closed).
     find_query: Option<String>,
+    /// Asset-catalog search box text.
+    asset_query: &'a mut String,
 }
 
 impl TabViewer for EngineTabs<'_> {
@@ -958,6 +976,12 @@ impl TabViewer for EngineTabs<'_> {
             DockTab::Search => {
                 search_tab(ui, self.search, self.project_root.as_deref(), self.open_file_req);
             }
+            DockTab::Assets => {
+                asset_catalog_ui(ui, self.asset_query, self.outliner_add);
+            }
+            DockTab::Resources => {
+                resource_monitor_ui(ui, self.scene.cubes.len());
+            }
             DockTab::File(path) => {
                 let lang = language_for(path);
                 // Only the active file consumes a pending Find "go to match" and
@@ -1044,6 +1068,7 @@ fn build_ui(
     ctx: &egui::Context,
     ui_state: &mut UiState,
     chat: &mut ChatUi,
+    toast: Option<&str>,
     mode: CameraMode,
     logo: Option<&egui::TextureHandle>,
     splash: Option<&egui::TextureHandle>,
@@ -1173,85 +1198,7 @@ fn build_ui(
     // doesn't immediately close it again.
     let mut popup_just_opened = false;
 
-    // Top bar: Menu + identity + tabs, all on one row.
-    egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            if ui.button("Menu").clicked() {
-                ui_state.menu_open = !ui_state.menu_open;
-                popup_just_opened = true;
-            }
-            ui.separator();
-            ui.label(egui::RichText::new("CoEngine").strong().color(ACCENT_GOLD));
-            ui.label(egui::RichText::new(format!("v{CO_VERSION}")));
-
-            // Reopen buttons for any closed dock widgets.
-            let tabs = [
-                (DockTab::Scene, "3D Scene"),
-                (DockTab::Logic, "Objects Added"),
-                (DockTab::Inspector, "Inspector"),
-                (DockTab::Explorer, "Explorer"),
-                (DockTab::AiChat, "AI Chat"),
-                (DockTab::Log, "Log"),
-                (DockTab::Terminal, "Terminal"),
-                (DockTab::Git, "Git"),
-                (DockTab::Search, "Search"),
-            ];
-            // (Reopen buttons are hidden during Focus mode — the minimized tabs
-            // are shown by the Focus row below instead.)
-            if focus_restore.is_none()
-                && tabs.iter().any(|(t, _)| dock_state.find_tab(t).is_none())
-            {
-                ui.separator();
-                ui.label(egui::RichText::new("Open:").small());
-                for (tab, label) in tabs {
-                    if dock_state.find_tab(&tab).is_none() && ui.button(label).clicked() {
-                        dock_state.push_to_focused_leaf(tab);
-                    }
-                }
-            }
-
-            // Focus mode: the other tabs are "minimized" up here. Click one to
-            // focus it instead; the focused tab's eye (in its corner) exits.
-            if focus_restore.is_some() {
-                ui.separator();
-                ui.label(egui::RichText::new("Focus:").small().color(ACCENT_GOLD));
-                let focused = dock_state.iter_all_tabs().next().map(|(_, t)| t.clone());
-                if let Some(f) = &focused {
-                    ui.label(egui::RichText::new(dock_tab_label(f)).small().strong());
-                }
-                let mut switch_to: Option<DockTab> = None;
-                if let Some(saved) = focus_restore.as_ref() {
-                    for (_, tab) in saved.iter_all_tabs() {
-                        if focused.as_ref() != Some(tab)
-                            && ui.small_button(dock_tab_label(tab)).clicked()
-                        {
-                            switch_to = Some(tab.clone());
-                        }
-                    }
-                }
-                if let Some(t) = switch_to {
-                    *dock_state = DockState::new(vec![t]);
-                }
-            }
-
-            // When the debug overlay is hidden, offer a way back (also bound to H).
-            if !ui_state.show_debug {
-                ui.separator();
-                if ui
-                    .button("Debug Info (H)")
-                    .on_hover_text("Show the controls & version overlay (H)")
-                    .clicked()
-                {
-                    ui_state.show_debug = true;
-                }
-            }
-        });
-        ui.add_space(2.0);
-    });
-
-    // Tool row (scene tools will live here later).
-    // Tool row: Save / Save All for the active file viewer (also Ctrl+S).
+    // Active file + dirty flags (used by the top bar, status bar, and Ctrl+S).
     let active_file: Option<PathBuf> = dock_state.find_active_focused().and_then(|(_, tab)| {
         match tab {
             DockTab::File(p) => Some(p.clone()),
@@ -1261,46 +1208,62 @@ fn build_ui(
     let active_dirty = active_file
         .as_ref()
         .is_some_and(|p| file_cache.get(p).is_some_and(FileView::is_dirty));
-    let any_dirty = file_cache.values().any(FileView::is_dirty);
-    let mut do_save = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
-    let mut do_save_all = false;
+    let do_save = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
+    let do_save_all = false;
     let mut do_save_project = false;
-    egui::TopBottomPanel::top("tool_bar").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            // Save the whole project (scene + settings + layout). Always available;
-            // a leading dot marks unsaved changes.
-            let label = if project_dirty {
-                "● Save Project"
-            } else {
-                "Save Project"
-            };
-            if ui
-                .button(label)
-                .on_hover_text("Save the project — scene, settings, and layout")
-                .clicked()
-            {
-                do_save_project = true;
-            }
-            ui.separator();
-            // File saves (the active editor file).
-            if ui
-                .add_enabled(active_dirty, egui::Button::new("Save File"))
-                .on_hover_text("Save the active file (Ctrl+S)")
-                .clicked()
-            {
-                do_save = true;
-            }
-            if ui
-                .add_enabled(any_dirty, egui::Button::new("Save All"))
-                .clicked()
-            {
-                do_save_all = true;
-            }
-            ui.separator();
-            ui.label(egui::RichText::new("Tools").small());
+    // Ctrl+P opens the command palette.
+    if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
+        ui_state.palette_open = true;
+        ui_state.palette_focus = true;
+        popup_just_opened = true;
+    }
+
+    // ---- Unified top bar: identity · command palette · actions ----
+    egui::TopBottomPanel::top("topbar")
+        .exact_height(46.0)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                if icon_button(ui, theme::icon::MENU, "Menu").clicked() {
+                    ui_state.menu_open = !ui_state.menu_open;
+                    popup_just_opened = true;
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("CoEngine").color(ACCENT_GOLD).strong());
+                ui.label(egui::RichText::new(format!("v{CO_VERSION}")).weak().small());
+
+                // Right cluster (right-to-left); the command pill fills the middle.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    if icon_button(ui, theme::icon::SETTINGS, "Settings").clicked() {
+                        ui_state.settings_open = true;
+                        popup_just_opened = true;
+                    }
+                    let disk = egui::RichText::new(theme::icon::SAVE).size(18.0).color(
+                        if project_dirty {
+                            ACCENT_GOLD
+                        } else {
+                            ui.visuals().weak_text_color()
+                        },
+                    );
+                    if ui
+                        .add(egui::Button::new(disk).frame(false))
+                        .on_hover_text("Save project (scene, settings, layout)")
+                        .clicked()
+                    {
+                        do_save_project = true;
+                    }
+                    ui.add_space(10.0);
+                    let w = (ui.available_width() - 10.0).clamp(160.0, 560.0);
+                    if command_pill(ui, w) {
+                        ui_state.palette_open = true;
+                        ui_state.palette_focus = true;
+                        popup_just_opened = true;
+                    }
+                });
+            });
         });
-    });
 
     // Bottom status bar: git branch (left); caret position, active-file language,
     // and unsaved-file count (right). The caret is last frame's value (see the
@@ -1315,8 +1278,10 @@ fn build_ui(
             ui.add_space(6.0);
             match &branch {
                 Some(b) => {
-                    ui.label("Branch:");
-                    ui.label(egui::RichText::new(b).color(ACCENT_GOLD));
+                    ui.label(
+                        egui::RichText::new(format!("{}  {b}", theme::icon::GIT_BRANCH))
+                            .color(ACCENT_GOLD),
+                    );
                 }
                 None => {
                     ui.label(egui::RichText::new("No repo").weak());
@@ -1332,11 +1297,67 @@ fn build_ui(
                     ui.label(l.to_uppercase());
                     ui.separator();
                 }
-                let dot = if unsaved > 0 { "● " } else { "" };
-                ui.label(format!("{dot}{unsaved} unsaved"));
+                if unsaved > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("{}  {unsaved} unsaved", theme::icon::POINT))
+                            .color(ACCENT_GOLD),
+                    );
+                } else {
+                    ui.label(egui::RichText::new("Saved").weak());
+                }
             });
         });
     });
+
+    // ---- Left activity rail: one icon per panel; click to open/focus it.
+    // Settings pinned to the bottom. ----
+    let mut rail_clicks: Vec<DockTab> = Vec::new();
+    egui::SidePanel::left("activity_rail")
+        .exact_width(52.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.add_space(8.0);
+            let items = [
+                (DockTab::Scene, theme::icon::SCENE, "3D Scene"),
+                (DockTab::Logic, theme::icon::CUBE, "Objects Added"),
+                (DockTab::Inspector, theme::icon::INSPECTOR, "Inspector"),
+                (DockTab::Explorer, theme::icon::FILES, "Explorer"),
+                (DockTab::Search, theme::icon::SEARCH, "Search"),
+                (DockTab::Git, theme::icon::GIT_BRANCH, "Git"),
+                (DockTab::Assets, theme::icon::BOX, "Assets"),
+                (DockTab::Resources, theme::icon::GAUGE, "Resources"),
+                (DockTab::AiChat, theme::icon::CHAT, "AI Chat"),
+                (DockTab::Log, theme::icon::LOG, "Log"),
+                (DockTab::Terminal, theme::icon::TERMINAL, "Terminal"),
+            ];
+            for (tab, glyph, label) in items {
+                let active = dock_state.find_tab(&tab).is_some();
+                if rail_button(ui, glyph, label, active) {
+                    rail_clicks.push(tab);
+                }
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if rail_button(ui, theme::icon::SETTINGS, "Settings", ui_state.settings_open) {
+                    ui_state.settings_open = true;
+                    popup_just_opened = true;
+                }
+            });
+        });
+    for tab in rail_clicks {
+        // Clicking a rail icon while in Focus mode exits focus first.
+        if let Some(saved) = focus_restore.take() {
+            *dock_state = saved;
+        }
+        if let Some(loc) = dock_state.find_tab(&tab) {
+            dock_state.set_active_tab(loc);
+        } else {
+            dock_state.push_to_focused_leaf(tab);
+        }
+    }
+
+    // Command palette (Ctrl+P / top-bar pill).
+    command_palette(ctx, ui_state, dock_state, project_path);
 
     if do_save_project {
         ui_state.save_requested = true;
@@ -1433,6 +1454,7 @@ fn build_ui(
             } else {
                 None
             },
+            asset_query: &mut ui_state.asset_query,
         };
         DockArea::new(dock_state)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -1492,6 +1514,34 @@ fn build_ui(
         }
     }
     service_fs_prompt(ctx, ui_state, file_cache, dock_state);
+
+    // Transient scene toast (camera mode switch, project save, …): top-center of
+    // the viewport, gold-bordered, fades out when its deadline passes.
+    if let (Some(rect), Some(msg)) = (scene_rect, toast) {
+        ctx.request_repaint(); // keep ticking so it clears on time
+        egui::Area::new(egui::Id::new("scene_toast"))
+            .pivot(egui::Align2::CENTER_TOP)
+            .fixed_pos(egui::pos2(rect.center().x, rect.top() + 14.0))
+            .constrain_to(rect)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(12, 14, 20, 232))
+                    .stroke(egui::Stroke::new(1.0, ACCENT_GOLD))
+                    .rounding(theme::RADIUS_LG)
+                    .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(msg)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(232, 227, 213)),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    });
+            });
+    }
 
     // Bottom-left debug overlay: controls + version on a dark plate, confined to
     // the 3D Scene viewport and only shown when the Scene tab is visible. Hidden
@@ -1575,10 +1625,20 @@ fn build_ui(
         }
     }
 
+    // Any modal/popup that should sit above the 3D scene overlays (so the gizmo
+    // and the on-screen toolbar, which draw on the Foreground layer, don't bleed
+    // through it).
+    let modal_open = ui_state.menu_open
+        || ui_state.settings_open
+        || ui_state.palette_open
+        || pending_command.is_some()
+        || ui_state.fs_prompt.is_some()
+        || ui_state.fs_prompt_error.is_some();
+
     // Translate gizmo over the selected object (draw-only; the drag is handled
     // by the engine's input). A foreground layer painter doesn't register an
     // interactive area, so it never blocks the camera.
-    if let (Some(i), Some(rect)) = (scene.selected, scene_rect) {
+    if let (false, Some(i), Some(rect)) = (modal_open, scene.selected, scene_rect) {
         if let Some((obj_pos, _)) = scene.cubes.get(i).copied() {
             let mut painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
@@ -1633,7 +1693,7 @@ fn build_ui(
     // scene when an object is selected. Its rect is recorded so clicks on it
     // don't fall through to the camera / picking.
     *toolbar_rect_out = None;
-    if let (Some(sel_i), Some(rect)) = (scene.selected, scene_rect) {
+    if let (false, Some(sel_i), Some(rect)) = (modal_open, scene.selected, scene_rect) {
         let area = egui::Area::new(egui::Id::new("gizmo_toolbar"))
             .pivot(egui::Align2::CENTER_BOTTOM)
             .fixed_pos(egui::pos2(rect.center().x, rect.bottom() - 14.0))
@@ -1975,6 +2035,81 @@ fn build_ui(
     }
 }
 
+/// A frameless icon button for the top bar (glyph from the bundled icon font).
+fn icon_button(ui: &mut egui::Ui, glyph: &str, hover: &str) -> egui::Response {
+    ui.add(egui::Button::new(egui::RichText::new(glyph).size(18.0)).frame(false))
+        .on_hover_text(hover)
+}
+
+/// The centered command-palette entry pill in the top bar. Returns true if clicked.
+fn command_pill(ui: &mut egui::Ui, width: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 29.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let border = if hovered {
+        ACCENT_GOLD
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke.color
+    };
+    let muted = ui.visuals().weak_text_color();
+    let p = ui.painter();
+    p.rect(
+        rect,
+        crate::theme::RADIUS,
+        ui.visuals().extreme_bg_color,
+        egui::Stroke::new(0.5, border),
+    );
+    p.text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{}   Search files or run a command…", theme::icon::SEARCH),
+        egui::FontId::proportional(13.0),
+        muted,
+    );
+    p.text(
+        egui::pos2(rect.right() - 10.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        "Ctrl P",
+        egui::FontId::proportional(11.0),
+        muted,
+    );
+    resp.clicked()
+}
+
+/// One activity-rail icon button: a 36×34 cell with a hover/active background and
+/// a gold left accent bar when active. Returns true if clicked.
+fn rail_button(ui: &mut egui::Ui, glyph: &str, hover: &str, active: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(36.0, 34.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let bg_active = ui.visuals().widgets.inactive.bg_fill;
+    let bg_hover = ui.visuals().widgets.hovered.weak_bg_fill;
+    let color = if active {
+        ACCENT_GOLD
+    } else if hovered {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let p = ui.painter();
+    if active {
+        p.rect_filled(rect, crate::theme::RADIUS, bg_active);
+        let bar = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.left() + 2.5, rect.bottom()),
+        );
+        p.rect_filled(bar, 0.0, ACCENT_GOLD);
+    } else if hovered {
+        p.rect_filled(rect, crate::theme::RADIUS, bg_hover);
+    }
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(20.0),
+        color,
+    );
+    resp.on_hover_text(hover).clicked()
+}
+
 /// True when the user presses the primary mouse button this frame outside the
 /// given popup window — the shared "click-away closes it" rule for modals/popups.
 fn clicked_outside<R>(ctx: &egui::Context, inner: &Option<egui::InnerResponse<R>>) -> bool {
@@ -2185,6 +2320,411 @@ fn service_fs_prompt(
     }
 }
 
+/// One actionable entry in the command palette.
+#[derive(Clone)]
+enum PaletteAction {
+    OpenTab(DockTab),
+    OpenFile(PathBuf),
+    SaveProject,
+    Settings,
+}
+
+/// The command palette (Ctrl+P / the top-bar pill): a query box over panel-open
+/// commands, Save Project, Settings, and project-file quick-open. Runs the chosen
+/// action. Closes on Esc / click-away / after a choice.
+fn command_palette(
+    ctx: &egui::Context,
+    ui_state: &mut UiState,
+    dock_state: &mut DockState<DockTab>,
+    project_root: Option<&Path>,
+) {
+    if !ui_state.palette_open {
+        return;
+    }
+    let panels = [
+        (DockTab::Scene, theme::icon::SCENE, "3D Scene"),
+        (DockTab::Logic, theme::icon::CUBE, "Objects Added"),
+        (DockTab::Inspector, theme::icon::INSPECTOR, "Inspector"),
+        (DockTab::Explorer, theme::icon::FILES, "Explorer"),
+        (DockTab::Search, theme::icon::SEARCH, "Search"),
+        (DockTab::Git, theme::icon::GIT_BRANCH, "Git"),
+        (DockTab::Assets, theme::icon::BOX, "Assets"),
+        (DockTab::Resources, theme::icon::GAUGE, "Resources"),
+        (DockTab::AiChat, theme::icon::CHAT, "AI Chat"),
+        (DockTab::Log, theme::icon::LOG, "Log"),
+        (DockTab::Terminal, theme::icon::TERMINAL, "Terminal"),
+    ];
+    let mut items: Vec<(String, PaletteAction)> = vec![
+        (format!("{}  Save project", theme::icon::SAVE), PaletteAction::SaveProject),
+        (format!("{}  Settings", theme::icon::SETTINGS), PaletteAction::Settings),
+    ];
+    for (tab, glyph, name) in panels {
+        items.push((format!("{glyph}  Open {name}"), PaletteAction::OpenTab(tab)));
+    }
+    let query = ui_state.palette_query.clone();
+    let q = query.trim().to_ascii_lowercase();
+    // Quick-open project files only once the user has typed something.
+    if !q.is_empty() {
+        if let Some(root) = project_root {
+            for path in list_project_files(root) {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                items.push((
+                    format!("{}  {}", theme::icon::FILE, rel.display()),
+                    PaletteAction::OpenFile(path),
+                ));
+            }
+        }
+    }
+    // Filter by the query (skip the leading icon glyph when matching).
+    let filtered: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, (label, _))| q.is_empty() || label.to_ascii_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .take(200)
+        .collect();
+
+    let mut chosen: Option<usize> = None;
+    let mut do_close = false;
+    let resp = egui::Window::new("palette")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .movable(false)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 78.0))
+        .default_width(540.0)
+        .show(ctx, |ui| {
+            ui.set_min_width(540.0);
+            ui.add_space(4.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut ui_state.palette_query)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(format!("{}  Search files or run a command…", theme::icon::SEARCH)),
+            );
+            if ui_state.palette_focus {
+                field.request_focus();
+                ui_state.palette_focus = false;
+            }
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(340.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for &i in &filtered {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 24.0],
+                                egui::SelectableLabel::new(false, &items[i].0),
+                            )
+                            .clicked()
+                        {
+                            chosen = Some(i);
+                        }
+                    }
+                });
+            if enter {
+                chosen = filtered.first().copied();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                do_close = true;
+            }
+        });
+
+    if let Some(i) = chosen {
+        match items[i].1.clone() {
+            PaletteAction::OpenTab(tab) => {
+                if let Some(loc) = dock_state.find_tab(&tab) {
+                    dock_state.set_active_tab(loc);
+                } else {
+                    dock_state.push_to_focused_leaf(tab);
+                }
+            }
+            PaletteAction::OpenFile(path) => open_file_tab(dock_state, path),
+            PaletteAction::SaveProject => ui_state.save_requested = true,
+            PaletteAction::Settings => ui_state.settings_open = true,
+        }
+        do_close = true;
+    }
+    if do_close || clicked_outside(ctx, &resp) {
+        ui_state.palette_open = false;
+        ui_state.palette_query.clear();
+    }
+}
+
+/// The Resource Monitor tab: designer-facing stats grouped into cards. Live where
+/// it's cheap (FPS, frame time, entity count, backend); placeholders ("—") for the
+/// rest until the engine is instrumented.
+fn resource_monitor_ui(ui: &mut egui::Ui, entity_count: usize) {
+    // Keep the live numbers ticking a couple times a second without a busy loop.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(500));
+    let dt = ui.ctx().input(|i| i.stable_dt).max(1e-4);
+    let fps = format!("{:.0}", 1.0 / dt);
+    let frame_ms = format!("{:.1} ms", dt * 1000.0);
+    let entities = entity_count.to_string();
+
+    egui::TopBottomPanel::top("resmon_header").show_inside(ui, |ui| {
+        ui.add_space(6.0);
+        ui.heading("Resource Monitor");
+        ui.label(
+            egui::RichText::new("Live where available; placeholders until instrumented.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
+    });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let sections: &[(&str, &[(&str, &str)])] = &[
+                    (
+                        "Performance",
+                        &[
+                            ("FPS", fps.as_str()),
+                            ("Frame time", frame_ms.as_str()),
+                            ("Draw calls", "—"),
+                            ("Triangles", "—"),
+                            ("GPU time", "—"),
+                        ],
+                    ),
+                    (
+                        "Memory",
+                        &[
+                            ("Process RAM", "—"),
+                            ("VRAM used", "—"),
+                            ("Texture memory", "—"),
+                            ("Buffers", "—"),
+                        ],
+                    ),
+                    (
+                        "Scene",
+                        &[
+                            ("Entities", entities.as_str()),
+                            ("Lights", "—"),
+                            ("Materials", "—"),
+                            ("Cameras", "1"),
+                        ],
+                    ),
+                    (
+                        "Assets",
+                        &[
+                            ("Meshes", "—"),
+                            ("Textures", "—"),
+                            ("On disk", "—"),
+                            ("Loaded / total", "—"),
+                        ],
+                    ),
+                    (
+                        "System",
+                        &[
+                            ("Renderer", "wgpu · DX12"),
+                            ("GPU", "—"),
+                            ("CPU", "—"),
+                            ("OS", "—"),
+                        ],
+                    ),
+                ];
+                for (title, metrics) in sections {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(*title).strong().color(ACCENT_GOLD));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, value) in *metrics {
+                            metric_card(ui, label, value);
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+            });
+    });
+}
+
+/// One Resource Monitor stat card: small muted label above, larger value below.
+fn metric_card(ui: &mut egui::Ui, label: &str, value: &str) {
+    let size = egui::vec2(152.0, 58.0);
+    let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = ui.painter();
+    p.rect(
+        rect,
+        crate::theme::RADIUS,
+        ui.visuals().faint_bg_color,
+        egui::Stroke::new(0.5, ui.visuals().widgets.inactive.bg_stroke.color),
+    );
+    p.text(
+        rect.min + egui::vec2(12.0, 9.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(11.5),
+        ui.visuals().weak_text_color(),
+    );
+    p.text(
+        rect.min + egui::vec2(12.0, 28.0),
+        egui::Align2::LEFT_TOP,
+        value,
+        egui::FontId::proportional(18.0),
+        ui.visuals().text_color(),
+    );
+}
+
+/// The Asset Catalog tab: a WoW-housing-style palette of 3D objects to drop into
+/// the scene, grouped by category with a filter box. Placeholder content for now —
+/// only `Cube` actually places (sets `add_cube`); the rest are "coming soon".
+fn asset_catalog_ui(ui: &mut egui::Ui, query: &mut String, add_cube: &mut bool) {
+    // (category, [(name, placeable)])
+    const CATALOG: &[(&str, &[(&str, bool)])] = &[
+        (
+            "Primitives",
+            &[
+                ("Cube", true),
+                ("Sphere", false),
+                ("Cylinder", false),
+                ("Cone", false),
+                ("Plane", false),
+                ("Capsule", false),
+            ],
+        ),
+        (
+            "Props",
+            &[
+                ("Crate", false),
+                ("Barrel", false),
+                ("Chest", false),
+                ("Chair", false),
+                ("Table", false),
+                ("Lantern", false),
+            ],
+        ),
+        (
+            "Nature",
+            &[
+                ("Tree", false),
+                ("Rock", false),
+                ("Bush", false),
+                ("Flower", false),
+            ],
+        ),
+        (
+            "Structures",
+            &[
+                ("Wall", false),
+                ("Floor", false),
+                ("Doorway", false),
+                ("Window", false),
+                ("Stairs", false),
+            ],
+        ),
+    ];
+
+    egui::TopBottomPanel::top("assets_header").show_inside(ui, |ui| {
+        ui.add_space(6.0);
+        ui.heading("Asset Catalog");
+        ui.add(
+            egui::TextEdit::singleline(query)
+                .desired_width(f32::INFINITY)
+                .hint_text(format!("{}  Filter assets…", theme::icon::SEARCH)),
+        );
+        ui.add_space(4.0);
+    });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        let q = query.trim().to_ascii_lowercase();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (cat, items) in CATALOG {
+                    let visible: Vec<&(&str, bool)> = items
+                        .iter()
+                        .filter(|(n, _)| q.is_empty() || n.to_ascii_lowercase().contains(&q))
+                        .collect();
+                    if visible.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(*cat).strong().color(ACCENT_GOLD));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, placeable) in visible {
+                            let glyph = if *placeable {
+                                theme::icon::CUBE
+                            } else {
+                                theme::icon::BOX
+                            };
+                            if asset_card(ui, name, glyph, *placeable) {
+                                *add_cube = true;
+                            }
+                        }
+                    });
+                }
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Drag-to-place and imported meshes (glTF / FBX / OBJ) are coming. \
+                         For now only Cube drops into the scene.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+    });
+}
+
+/// One asset-catalog card: a thumbnail + name. Returns true on click when enabled.
+fn asset_card(ui: &mut egui::Ui, name: &str, glyph: &str, enabled: bool) -> bool {
+    let size = egui::vec2(96.0, 108.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hov = resp.hovered() && enabled;
+    let border = if hov {
+        ACCENT_GOLD
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke.color
+    };
+    let card_bg = if hov {
+        ui.visuals().widgets.hovered.weak_bg_fill
+    } else {
+        ui.visuals().faint_bg_color
+    };
+    let icon_col = if enabled {
+        ACCENT_GOLD
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let text_col = if enabled {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let thumb_bg = ui.visuals().extreme_bg_color;
+    let p = ui.painter();
+    p.rect(rect, crate::theme::RADIUS, card_bg, egui::Stroke::new(0.5, border));
+    let thumb = egui::Rect::from_min_size(
+        rect.min + egui::vec2(8.0, 8.0),
+        egui::vec2(size.x - 16.0, 64.0),
+    );
+    p.rect_filled(thumb, crate::theme::RADIUS, thumb_bg);
+    p.text(
+        thumb.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(30.0),
+        icon_col,
+    );
+    p.text(
+        egui::pos2(rect.center().x, thumb.bottom() + 9.0),
+        egui::Align2::CENTER_TOP,
+        name,
+        egui::FontId::proportional(12.0),
+        text_col,
+    );
+    resp.on_hover_text(if enabled {
+        "Click to add to the scene"
+    } else {
+        "Coming soon"
+    })
+    .clicked()
+        && enabled
+}
+
 /// The in-file Find/Replace bar (a small floating window). Operates directly on
 /// the active file's buffer; Prev/Next set `find_goto` (the editor scrolls/selects
 /// the match), Replace/All edit the buffer in place.
@@ -2310,29 +2850,81 @@ fn log_tab(
                 ui.add_space(4.0);
             });
             egui::CentralPanel::default().show_inside(ui, |ui| {
+                let t0 = history.first().map(|h| h.at);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         for (i, entry) in history.iter().enumerate() {
-                            let mut rt = egui::RichText::new(&entry.label).small();
-                            if i == cursor {
-                                rt = rt.strong().color(ACCENT_GOLD);
-                            } else if i > cursor {
-                                rt = rt.weak();
-                            }
-                            ui.label(rt);
+                            let (glyph, icon_col) = log_icon(&entry.label);
+                            let secs = t0
+                                .map(|t0| entry.at.saturating_duration_since(t0).as_secs())
+                                .unwrap_or(0);
+                            let time = format!("{:02}:{:02}", secs / 60, secs % 60);
+                            let count = entry.entities.len();
+                            // Current state = bold gold; already-undone (redoable) = dimmed.
+                            let future = i > cursor;
+                            let current = i == cursor;
+                            ui.horizontal(|ui| {
+                                let gc = if future {
+                                    ui.visuals().weak_text_color()
+                                } else {
+                                    icon_col
+                                };
+                                ui.label(egui::RichText::new(glyph).color(gc).small());
+                                let mut lt = egui::RichText::new(&entry.label).small();
+                                if current {
+                                    lt = lt.strong().color(ACCENT_GOLD);
+                                } else if future {
+                                    lt = lt.weak();
+                                }
+                                ui.label(lt);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(egui::RichText::new(time).weak().small());
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(format!("{count} obj"))
+                                                .weak()
+                                                .small(),
+                                        );
+                                    },
+                                );
+                            });
                         }
                     });
             });
 }
 
+/// Pick an icon + tint for a Log entry from its action label.
+fn log_icon(label: &str) -> (&'static str, egui::Color32) {
+    let l = label.to_ascii_lowercase();
+    let green = egui::Color32::from_rgb(126, 196, 122);
+    let red = egui::Color32::from_rgb(220, 122, 112);
+    if l.starts_with("coe-ai") {
+        (theme::icon::ROBOT, ACCENT_COBALT)
+    } else if l.contains("add") || l.contains("new project") {
+        (theme::icon::PLUS, green)
+    } else if l.contains("remove") || l.contains("delete") || l.contains("clear") {
+        (theme::icon::TRASH, red)
+    } else if l.contains("move") || l.contains("rotate") || l.contains("scale") || l.contains("edit")
+    {
+        (theme::icon::PENCIL, ACCENT_GOLD)
+    } else {
+        // session start / opened / saved / misc
+        (theme::icon::POINT, egui::Color32::from_gray(150))
+    }
+}
 
-/// One entry in the session action log / undo history: a label plus the full
-/// scene snapshot taken right after that action.
+
+/// One entry in the session action log / undo history: a label, the wall-clock
+/// instant it happened (for the Log's relative timestamps), plus the full scene
+/// snapshot taken right after that action.
 #[derive(Clone)]
 struct HistoryEntry {
     label: String,
+    at: Instant,
     entities: Vec<Entity>,
     selected: Option<usize>,
 }
@@ -2450,6 +3042,9 @@ struct State {
     /// Screen rect (egui points) of the on-screen gizmo toolbar, so clicks on it
     /// don't fall through to camera orbit / pick.
     toolbar_rect: Option<egui::Rect>,
+    /// Transient scene toast: (message, deadline). Shown in the 3D viewport until
+    /// the deadline; set on camera-mode switch, project save, etc.
+    toast: Option<(String, Instant)>,
     /// Which gizmo axis (0=X,1=Y,2=Z) is being dragged, if any.
     gizmo_drag: Option<usize>,
     /// Scale-drag start state: uniform scale + cursor distance from center at grab.
@@ -2682,6 +3277,9 @@ impl State {
         });
 
         let egui_ctx = egui::Context::default();
+        // Design-system foundation: bundle the icon font + apply global style tokens.
+        theme::install_fonts(&egui_ctx);
+        theme::apply_style(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -2758,6 +3356,7 @@ impl State {
             gizmo_mode: GizmoMode::Translate,
             toolbar_rect: None,
             gizmo_drag: None,
+            toast: None,
             gizmo_scale_start: 1.0,
             gizmo_scale_dist0: 1.0,
             shift_down: false,
@@ -2777,6 +3376,7 @@ impl State {
             ui,
             history: vec![HistoryEntry {
                 label: "Session start".to_string(),
+                at: Instant::now(),
                 entities: Vec::new(),
                 selected: None,
             }],
@@ -3116,6 +3716,7 @@ impl State {
         self.history.truncate(self.history_cursor + 1);
         self.history.push(HistoryEntry {
             label: label.into(),
+            at: Instant::now(),
             entities: self.entities.clone(),
             selected: self.selected,
         });
@@ -3206,6 +3807,7 @@ impl State {
         // The loaded scene becomes the new history baseline (undo can't go past it).
         self.history = vec![HistoryEntry {
             label: "Opened project".to_string(),
+            at: Instant::now(),
             entities: self.entities.clone(),
             selected: None,
         }];
@@ -3256,6 +3858,8 @@ impl State {
                 self.project_path = Some(dir.to_path_buf());
                 self.project_dirty = false;
                 self.ui.project_status = Some(format!("Saved to {}", dir.display()));
+                self.toast =
+                    Some(("Project saved".to_string(), Instant::now() + Duration::from_millis(1500)));
                 println!("Saved project to {}", dir.display());
                 self.update_global_config();
             }
@@ -3326,6 +3930,7 @@ impl State {
         self.dock_state = build_dock_state();
         self.history = vec![HistoryEntry {
             label: "New project".to_string(),
+            at: Instant::now(),
             entities: Vec::new(),
             selected: None,
         }];
@@ -3369,6 +3974,11 @@ impl State {
             }
         }
         self.window.set_title(&title_for(self.mode));
+        let name = match self.mode {
+            CameraMode::Orbit => "Orbit camera",
+            CameraMode::Fly => "Fly camera (WASD)",
+        };
+        self.toast = Some((name.to_string(), Instant::now() + Duration::from_millis(1500)));
         self.update_camera();
     }
 
@@ -3762,6 +4372,12 @@ impl State {
         // --- egui UI over the scene ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
+        // Transient scene toast (mode switch, save, …) while its deadline holds.
+        let toast_msg: Option<String> = self
+            .toast
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(msg, _)| msg.clone());
         let mode = self.mode;
         let logo = self.logo_texture.as_ref();
         let splash = self.splash_texture.as_ref();
@@ -3795,6 +4411,7 @@ impl State {
                 c,
                 ui_state,
                 chat,
+                toast_msg.as_deref(),
                 mode,
                 logo,
                 splash,
@@ -4043,7 +4660,12 @@ impl ApplicationHandler for App {
                 event: key_event, ..
             } => {
                 // Let egui keep keyboard input when it's focused (e.g. typing in chat).
+                // Clear movement keys first: if focus moves into an egui field while a
+                // key is held, its release is swallowed here and would otherwise stick
+                // (camera drifting as if the key were still down).
                 if egui_consumed {
+                    state.keys = Keys::default();
+                    state.nudge = NudgeKeys::default();
                     return;
                 }
                 if let PhysicalKey::Code(code) = key_event.physical_key {
@@ -4088,10 +4710,10 @@ impl ApplicationHandler for App {
                         KeyCode::Period => state.nudge.rot_right = pressed,
                         KeyCode::KeyX if first_press => state.show_grid = !state.show_grid,
                         KeyCode::KeyR if first_press => {
+                            // R toggles Move <-> Rotate only; Scale lives on the toolbar.
                             state.gizmo_mode = match state.gizmo_mode {
-                                GizmoMode::Translate => GizmoMode::Rotate,
-                                GizmoMode::Rotate => GizmoMode::Scale,
-                                GizmoMode::Scale => GizmoMode::Translate,
+                                GizmoMode::Rotate => GizmoMode::Translate,
+                                _ => GizmoMode::Rotate,
                             };
                         }
                         _ => {}

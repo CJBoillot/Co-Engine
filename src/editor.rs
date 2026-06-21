@@ -567,6 +567,35 @@ pub(crate) fn project_search(root: &Path, query: &str) -> Vec<SearchHit> {
     hits
 }
 
+/// Every file path under `root` (skipping `.git`, `target`, `node_modules`),
+/// capped at 4000, for the command palette's quick-open.
+pub(crate) fn list_project_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    const MAX: usize = 4000;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                let name = e.file_name();
+                if matches!(name.to_string_lossy().as_ref(), ".git" | "target" | "node_modules") {
+                    continue;
+                }
+                stack.push(path);
+            } else {
+                out.push(path);
+                if out.len() >= MAX {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The project-wide Search dock tab: a query box + a clickable list of results.
 /// Clicking a result records the file in `open` (the caller opens a viewer tab).
 pub(crate) fn search_tab(
