@@ -161,10 +161,202 @@ pub(crate) fn file_view_ui(ui: &mut egui::Ui, view: &mut FileView, lang: &str) {
     }
 }
 
+/// A pending Explorer file operation. Raised by the tree's right-click menu and
+/// shown as a modal that collects a name (or a delete confirmation) before the
+/// op runs. `name` buffers the user's text as they type in the modal.
+pub(crate) enum FsPrompt {
+    NewFile { parent: PathBuf, name: String },
+    NewFolder { parent: PathBuf, name: String },
+    Rename { target: PathBuf, name: String },
+    Delete { target: PathBuf },
+}
+
+/// What a completed file op did, so the caller can sync open tabs / the cache.
+pub(crate) enum FsOutcome {
+    /// A file was created (the caller may open it in a viewer tab).
+    CreatedFile(PathBuf),
+    /// A folder was created (nothing to open).
+    CreatedFolder,
+    /// `from` was renamed/moved to `to`.
+    Renamed { from: PathBuf, to: PathBuf },
+    /// `target` (file or folder) was removed.
+    Deleted(PathBuf),
+}
+
+/// Reject empty names and anything with path separators or parent refs — the
+/// Explorer only creates/renames within the chosen folder, never across paths.
+fn validate_name(name: &str) -> Result<&str, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("Name can't be empty".into());
+    }
+    if n.contains('/') || n.contains('\\') || n == "." || n == ".." {
+        return Err("Name can't contain path separators".into());
+    }
+    Ok(n)
+}
+
+/// Execute a confirmed file op on disk. Errors are returned (surfaced in the
+/// modal), never panicking — the tree re-reads disk each frame, so success
+/// shows up automatically.
+pub(crate) fn run_fs_prompt(prompt: &FsPrompt) -> Result<FsOutcome, String> {
+    let map_io = |e: std::io::Error| e.to_string();
+    match prompt {
+        FsPrompt::NewFile { parent, name } => {
+            let p = parent.join(validate_name(name)?);
+            if p.exists() {
+                return Err("A file or folder with that name already exists".into());
+            }
+            std::fs::File::create(&p).map_err(map_io)?;
+            Ok(FsOutcome::CreatedFile(p))
+        }
+        FsPrompt::NewFolder { parent, name } => {
+            let p = parent.join(validate_name(name)?);
+            if p.exists() {
+                return Err("A file or folder with that name already exists".into());
+            }
+            std::fs::create_dir(&p).map_err(map_io)?;
+            Ok(FsOutcome::CreatedFolder)
+        }
+        FsPrompt::Rename { target, name } => {
+            let valid = validate_name(name)?;
+            let to = target
+                .parent()
+                .map(|p| p.join(valid))
+                .ok_or_else(|| "Can't rename this item".to_string())?;
+            if to == *target {
+                return Err("That's already the name".into());
+            }
+            if to.exists() {
+                return Err("A file or folder with that name already exists".into());
+            }
+            std::fs::rename(target, &to).map_err(map_io)?;
+            Ok(FsOutcome::Renamed {
+                from: target.clone(),
+                to,
+            })
+        }
+        FsPrompt::Delete { target } => {
+            if target.is_dir() {
+                std::fs::remove_dir_all(target).map_err(map_io)?;
+            } else {
+                std::fs::remove_file(target).map_err(map_io)?;
+            }
+            Ok(FsOutcome::Deleted(target.clone()))
+        }
+    }
+}
+
+/// Move `src` (file or folder) into directory `dest_dir`, keeping its name.
+/// `Ok(None)` means "nothing to do" (dropped back into its own folder); `Ok(Some)`
+/// returns `(from, to)`; `Err` is a real conflict (name taken, into-itself).
+pub(crate) fn move_into(src: &Path, dest_dir: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let name = src
+        .file_name()
+        .ok_or_else(|| "Can't move this item".to_string())?;
+    // No-op: already directly inside the destination.
+    if src.parent() == Some(dest_dir) {
+        return Ok(None);
+    }
+    // Can't drop a folder onto itself or into its own subtree.
+    if dest_dir == src || dest_dir.starts_with(src) {
+        return Err("Can't move a folder into itself".into());
+    }
+    let to = dest_dir.join(name);
+    if to.exists() {
+        return Err("The destination already has an item with that name".into());
+    }
+    std::fs::rename(src, &to).map_err(|e| e.to_string())?;
+    Ok(Some((src.to_path_buf(), to)))
+}
+
+/// Context-menu items for a folder (or the project root): create inside it, and
+/// — unless it's the root — rename/delete it. Sets `fs_req` on click.
+fn folder_menu(ui: &mut egui::Ui, dir: &Path, is_root: bool, fs_req: &mut Option<FsPrompt>) {
+    if ui.button("New File").clicked() {
+        *fs_req = Some(FsPrompt::NewFile {
+            parent: dir.to_path_buf(),
+            name: String::new(),
+        });
+        ui.close_menu();
+    }
+    if ui.button("New Folder").clicked() {
+        *fs_req = Some(FsPrompt::NewFolder {
+            parent: dir.to_path_buf(),
+            name: String::new(),
+        });
+        ui.close_menu();
+    }
+    if !is_root {
+        ui.separator();
+        if ui.button("Rename").clicked() {
+            *fs_req = Some(FsPrompt::Rename {
+                target: dir.to_path_buf(),
+                name: file_name_string(dir),
+            });
+            ui.close_menu();
+        }
+        if ui.button("Delete").clicked() {
+            *fs_req = Some(FsPrompt::Delete {
+                target: dir.to_path_buf(),
+            });
+            ui.close_menu();
+        }
+    }
+}
+
+/// Context-menu items for a file: create a sibling, rename, or delete it.
+fn file_menu(ui: &mut egui::Ui, path: &Path, fs_req: &mut Option<FsPrompt>) {
+    if let Some(parent) = path.parent() {
+        if ui.button("New File").clicked() {
+            *fs_req = Some(FsPrompt::NewFile {
+                parent: parent.to_path_buf(),
+                name: String::new(),
+            });
+            ui.close_menu();
+        }
+        if ui.button("New Folder").clicked() {
+            *fs_req = Some(FsPrompt::NewFolder {
+                parent: parent.to_path_buf(),
+                name: String::new(),
+            });
+            ui.close_menu();
+        }
+        ui.separator();
+    }
+    if ui.button("Rename").clicked() {
+        *fs_req = Some(FsPrompt::Rename {
+            target: path.to_path_buf(),
+            name: file_name_string(path),
+        });
+        ui.close_menu();
+    }
+    if ui.button("Delete").clicked() {
+        *fs_req = Some(FsPrompt::Delete {
+            target: path.to_path_buf(),
+        });
+        ui.close_menu();
+    }
+}
+
+/// The final path component as an owned string (empty if none).
+fn file_name_string(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Explorer: an IDE-style file tree rooted at the project folder. The project
 /// folder is the top of the hierarchy — nothing above it is reachable. Clicking
-/// a file records it in `open` (the caller opens a viewer tab for it).
-pub(crate) fn file_tree_ui(ui: &mut egui::Ui, root: &Path, open: &mut Option<PathBuf>) {
+/// a file records it in `open` (the caller opens a viewer tab for it); right-click
+/// raises a file op in `fs_req` (the caller runs it via a modal).
+pub(crate) fn file_tree_ui(
+    ui: &mut egui::Ui,
+    root: &Path,
+    open: &mut Option<PathBuf>,
+    fs_req: &mut Option<FsPrompt>,
+    move_req: &mut Option<(PathBuf, PathBuf)>,
+) {
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -172,15 +364,57 @@ pub(crate) fn file_tree_ui(ui: &mut egui::Ui, root: &Path, open: &mut Option<Pat
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| root.display().to_string());
-            ui.label(egui::RichText::new(name).strong().color(ACCENT_GOLD));
+            let header = ui.add(
+                egui::Label::new(egui::RichText::new(name).strong().color(ACCENT_GOLD))
+                    .sense(egui::Sense::click()),
+            );
+            // The root header is both a right-click menu and a drop target (move
+            // a dragged item to the top level).
+            drop_target(ui, &header, root, move_req);
+            header.context_menu(|ui| folder_menu(ui, root, true, fs_req));
             ui.separator();
-            dir_contents_ui(ui, root, open);
+            dir_contents_ui(ui, root, open, fs_req, move_req);
+
+            // Right-clicking the blank area below the tree targets the project
+            // root, so you can create at the top level without finding the header;
+            // dropping there moves the item to the root too.
+            let avail = ui.available_size();
+            if avail.y > 1.0 {
+                let (_rect, resp) =
+                    ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+                drop_target(ui, &resp, root, move_req);
+                resp.context_menu(|ui| folder_menu(ui, root, true, fs_req));
+            }
         });
 }
 
+/// Mark `resp` as a drop target for a dragged tree item: highlight while a drag
+/// hovers it, and on release request a move into `dest_dir`.
+fn drop_target(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    dest_dir: &Path,
+    move_req: &mut Option<(PathBuf, PathBuf)>,
+) {
+    if resp.dnd_hover_payload::<PathBuf>().is_some() {
+        ui.painter()
+            .rect_stroke(resp.rect, 2.0, egui::Stroke::new(1.0, ACCENT_GOLD));
+    }
+    if let Some(src) = resp.dnd_release_payload::<PathBuf>() {
+        *move_req = Some((src.as_ref().clone(), dest_dir.to_path_buf()));
+    }
+}
+
 /// Recursively render one directory's children (folders first, then files,
-/// case-insensitive). Folders are collapsing headers; files are clickable.
-pub(crate) fn dir_contents_ui(ui: &mut egui::Ui, dir: &Path, open: &mut Option<PathBuf>) {
+/// case-insensitive). Folders are collapsing headers (and drop targets); files
+/// are clickable and draggable. Every node has a right-click context menu.
+pub(crate) fn dir_contents_ui(
+    ui: &mut egui::Ui,
+    dir: &Path,
+    open: &mut Option<PathBuf>,
+    fs_req: &mut Option<FsPrompt>,
+    move_req: &mut Option<(PathBuf, PathBuf)>,
+) {
     let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
         Ok(rd) => rd.flatten().collect(),
         Err(_) => return,
@@ -193,12 +427,24 @@ pub(crate) fn dir_contents_ui(ui: &mut egui::Ui, dir: &Path, open: &mut Option<P
         let path = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            egui::CollapsingHeader::new(name)
+            let header = egui::CollapsingHeader::new(name)
                 .id_salt(&path)
                 .default_open(false)
-                .show(ui, |ui| dir_contents_ui(ui, &path, open));
-        } else if ui.selectable_label(false, name).clicked() {
-            *open = Some(path);
+                .show(ui, |ui| dir_contents_ui(ui, &path, open, fs_req, move_req));
+            let hr = header.header_response;
+            drop_target(ui, &hr, &path, move_req);
+            hr.context_menu(|ui| folder_menu(ui, &path, false, fs_req));
+        } else {
+            // A normal selectable label (senses clicks → open) with drag sense
+            // added on top, so a quick click opens and a press-drag moves the file.
+            let resp = ui
+                .selectable_label(false, name)
+                .interact(egui::Sense::click_and_drag());
+            if resp.clicked() {
+                *open = Some(path.clone());
+            }
+            resp.dnd_set_drag_payload(path.clone());
+            resp.context_menu(|ui| file_menu(ui, &path, fs_req));
         }
     }
 }

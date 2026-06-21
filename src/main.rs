@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.16";
+pub(crate) const CO_VERSION: &str = "0.0.17";
 
 mod ai;
 use ai::*;
@@ -145,6 +145,10 @@ struct UiState {
     /// commit flag (record one undo entry when the slider interaction ends).
     scale_req: Option<f32>,
     scale_commit: bool,
+    /// Pending Explorer file op (new/rename/delete), shown as a modal until
+    /// confirmed or canceled. `fs_prompt_error` shows a failed op's message.
+    fs_prompt: Option<FsPrompt>,
+    fs_prompt_error: Option<String>,
 }
 
 impl Default for UiState {
@@ -177,6 +181,8 @@ impl Default for UiState {
             gizmo_mode_req: None,
             scale_req: None,
             scale_commit: false,
+            fs_prompt: None,
+            fs_prompt_error: None,
         }
     }
 }
@@ -185,7 +191,7 @@ impl Default for UiState {
 fn dock_tab_label(tab: &DockTab) -> String {
     match tab {
         DockTab::Scene => "3D Scene".to_string(),
-        DockTab::Logic => "Logic".to_string(),
+        DockTab::Logic => "Objects Added".to_string(),
         DockTab::Inspector => "Inspector".to_string(),
         DockTab::Explorer => "Explorer".to_string(),
         DockTab::AiChat => "AI Chat".to_string(),
@@ -811,6 +817,11 @@ struct EngineTabs<'a> {
     /// Set when the user clicks a file in the Explorer (handled after the dock
     /// pass, since adding a tab needs `&mut DockState`).
     open_file_req: &'a mut Option<PathBuf>,
+    /// Set when the user picks an Explorer right-click op (new/rename/delete);
+    /// handled after the dock pass (it opens a modal / mutates the dock state).
+    fs_req: &'a mut Option<FsPrompt>,
+    /// Set when the user drags a tree item onto a folder: `(src, dest_dir)`.
+    fs_move_req: &'a mut Option<(PathBuf, PathBuf)>,
     /// Decoded file contents for `File` viewer tabs, keyed by path (lazy-loaded).
     file_cache: &'a mut HashMap<PathBuf, FileView>,
     /// The in-engine terminal's shell session (lazily started).
@@ -888,7 +899,9 @@ impl TabViewer for EngineTabs<'_> {
                 );
             }
             DockTab::Explorer => match &self.project_root {
-                Some(root) => file_tree_ui(ui, root, self.open_file_req),
+                Some(root) => {
+                    file_tree_ui(ui, root, self.open_file_req, self.fs_req, self.fs_move_req)
+                }
                 None => {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -1132,7 +1145,7 @@ fn build_ui(
             // Reopen buttons for any closed dock widgets.
             let tabs = [
                 (DockTab::Scene, "3D Scene"),
-                (DockTab::Logic, "Logic"),
+                (DockTab::Logic, "Objects Added"),
                 (DockTab::Inspector, "Inspector"),
                 (DockTab::Explorer, "Explorer"),
                 (DockTab::AiChat, "AI Chat"),
@@ -1271,6 +1284,8 @@ fn build_ui(
     // The dockable workspace fills the central area. Each tab can be dragged into a
     // column or a full-screen tab and resized; the 3D Scene tab is the live viewport.
     let mut open_file_req: Option<PathBuf> = None;
+    let mut fs_req: Option<FsPrompt> = None;
+    let mut fs_move_req: Option<(PathBuf, PathBuf)> = None;
     let mut focus_req: Option<DockTab> = None;
     let mut close_req: Option<DockTab> = None;
     {
@@ -1284,6 +1299,8 @@ fn build_ui(
             scene_rect_out: &mut *scene_rect_out,
             project_root: project_path.map(|p| p.to_path_buf()),
             open_file_req: &mut open_file_req,
+            fs_req: &mut fs_req,
+            fs_move_req: &mut fs_move_req,
             file_cache,
             terminal: &mut *terminal,
             terminal_shell: ui_state.shell.command().to_string(),
@@ -1332,16 +1349,31 @@ fn build_ui(
     // A file was clicked in the Explorer: open (or focus) a viewer tab for it,
     // docked in the same leaf as Logic (top-center) when Logic is present.
     if let Some(path) = open_file_req {
-        let tab = DockTab::File(path);
-        if let Some(loc) = dock_state.find_tab(&tab) {
-            dock_state.set_active_tab(loc);
-        } else {
-            if let Some((surface, node, _)) = dock_state.find_tab(&DockTab::Logic) {
-                dock_state.set_focused_node_and_surface((surface, node));
+        open_file_tab(dock_state, path);
+    }
+
+    // An Explorer right-click op was chosen: stage it in the modal (fresh, so any
+    // earlier error message clears). Then render the modal and run it on confirm.
+    if let Some(req) = fs_req {
+        ui_state.fs_prompt = Some(req);
+        ui_state.fs_prompt_error = None;
+    }
+    // A tree item was dragged onto a folder: move it, syncing open tabs. A failed
+    // move (name conflict, into-itself) surfaces as a standalone error popup.
+    if let Some((from, dest)) = fs_move_req {
+        match move_into(&from, &dest) {
+            Ok(Some((from, to))) => {
+                let was_file = to.is_file();
+                close_file_tabs(dock_state, file_cache, |p| path_is_within(p, &from));
+                if was_file {
+                    open_file_tab(dock_state, to);
+                }
             }
-            dock_state.push_to_focused_leaf(tab);
+            Ok(None) => {}
+            Err(e) => ui_state.fs_prompt_error = Some(e),
         }
     }
+    service_fs_prompt(ctx, ui_state, file_cache, dock_state);
 
     // Bottom-left debug overlay: controls + version on a dark plate, confined to
     // the 3D Scene viewport and only shown when the Scene tab is visible. Hidden
@@ -1806,6 +1838,205 @@ fn build_ui(
                 });
                 ui.add_space(8.0);
             });
+    }
+}
+
+/// Open (or focus) a viewer tab for `path`, docked in the same leaf as Logic
+/// (top-center) when Logic is present. Shared by the Explorer click handler and
+/// the "new file" op.
+fn open_file_tab(dock_state: &mut DockState<DockTab>, path: PathBuf) {
+    let tab = DockTab::File(path);
+    if let Some(loc) = dock_state.find_tab(&tab) {
+        dock_state.set_active_tab(loc);
+    } else {
+        if let Some((surface, node, _)) = dock_state.find_tab(&DockTab::Logic) {
+            dock_state.set_focused_node_and_surface((surface, node));
+        }
+        dock_state.push_to_focused_leaf(tab);
+    }
+}
+
+/// Close any open `File` viewer tabs whose path satisfies `pred` (used after a
+/// rename/delete so stale tabs don't linger), and drop their cached contents.
+fn close_file_tabs(
+    dock_state: &mut DockState<DockTab>,
+    file_cache: &mut HashMap<PathBuf, FileView>,
+    pred: impl Fn(&Path) -> bool,
+) {
+    let affected: Vec<DockTab> = dock_state
+        .iter_all_tabs()
+        .filter_map(|(_, t)| match t {
+            DockTab::File(p) if pred(p) => Some(DockTab::File(p.clone())),
+            _ => None,
+        })
+        .collect();
+    for tab in affected {
+        if let DockTab::File(p) = &tab {
+            file_cache.remove(p);
+        }
+        if let Some(loc) = dock_state.find_tab(&tab) {
+            dock_state.remove_tab(loc);
+        }
+    }
+}
+
+/// True if `p` is `base` itself or lives underneath it (so a folder rename/delete
+/// also catches the files open from inside it).
+fn path_is_within(p: &Path, base: &Path) -> bool {
+    p == base || p.starts_with(base)
+}
+
+/// Render the Explorer file-op modal (new file/folder, rename, delete) when one
+/// is pending, and run the op on confirm — syncing open tabs and the file cache.
+fn service_fs_prompt(
+    ctx: &egui::Context,
+    ui_state: &mut UiState,
+    file_cache: &mut HashMap<PathBuf, FileView>,
+    dock_state: &mut DockState<DockTab>,
+) {
+    if ui_state.fs_prompt.is_none() {
+        // No naming modal open, but a drag-move may have failed — show it on its
+        // own so the error isn't lost.
+        if let Some(err) = ui_state.fs_prompt_error.clone() {
+            let mut dismiss = false;
+            egui::Window::new("fs_error")
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .movable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Couldn't move that")
+                            .strong()
+                            .color(ACCENT_GOLD),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(err).color(egui::Color32::from_rgb(228, 128, 118)),
+                    );
+                    ui.add_space(10.0);
+                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        dismiss = true;
+                    }
+                    ui.add_space(8.0);
+                });
+            if dismiss {
+                ui_state.fs_prompt_error = None;
+            }
+        }
+        return;
+    }
+
+    let mut do_run = false;
+    let mut do_cancel = false;
+    egui::Window::new("fs_prompt")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .movable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(340.0);
+            ui.add_space(8.0);
+            // Title + (for naming ops) an editable name field; Enter confirms.
+            let prompt = ui_state.fs_prompt.as_mut().expect("prompt present");
+            let (title, name): (&str, Option<&mut String>) = match prompt {
+                FsPrompt::NewFile { name, .. } => ("New File", Some(name)),
+                FsPrompt::NewFolder { name, .. } => ("New Folder", Some(name)),
+                FsPrompt::Rename { name, .. } => ("Rename", Some(name)),
+                FsPrompt::Delete { target } => {
+                    let label = target
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| target.display().to_string());
+                    ui.label(
+                        egui::RichText::new(format!("Delete \"{label}\"?"))
+                            .strong()
+                            .color(ACCENT_GOLD),
+                    );
+                    if target.is_dir() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("This folder and everything in it will be removed.")
+                                .weak(),
+                        );
+                    }
+                    ("Delete", None)
+                }
+            };
+            if let Some(buf) = name {
+                ui.label(egui::RichText::new(title).strong().color(ACCENT_GOLD));
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(buf)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("name"),
+                );
+                field.request_focus();
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    do_run = true;
+                }
+            }
+            if let Some(err) = &ui_state.fs_prompt_error {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(228, 128, 118)));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let confirm = match ui_state.fs_prompt.as_ref().expect("prompt present") {
+                    FsPrompt::Delete { .. } => "Delete",
+                    FsPrompt::Rename { .. } => "Rename",
+                    _ => "Create",
+                };
+                if ui.button(confirm).clicked() {
+                    do_run = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    do_cancel = true;
+                }
+            });
+            ui.add_space(8.0);
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                do_cancel = true;
+            }
+        });
+
+    if do_cancel {
+        ui_state.fs_prompt = None;
+        ui_state.fs_prompt_error = None;
+        return;
+    }
+    if !do_run {
+        return;
+    }
+
+    let prompt = ui_state.fs_prompt.as_ref().expect("prompt present");
+    match run_fs_prompt(prompt) {
+        Ok(outcome) => {
+            match outcome {
+                FsOutcome::CreatedFile(p) => open_file_tab(dock_state, p),
+                FsOutcome::CreatedFolder => {}
+                FsOutcome::Renamed { from, to } => {
+                    // Reopen a single renamed file at its new path; just close
+                    // anything affected for a folder rename.
+                    let was_file = to.is_file();
+                    close_file_tabs(dock_state, file_cache, |p| path_is_within(p, &from));
+                    if was_file {
+                        open_file_tab(dock_state, to);
+                    }
+                }
+                FsOutcome::Deleted(target) => {
+                    close_file_tabs(dock_state, file_cache, |p| path_is_within(p, &target));
+                }
+            }
+            ui_state.fs_prompt = None;
+            ui_state.fs_prompt_error = None;
+        }
+        // Keep the modal open and show why it failed.
+        Err(e) => ui_state.fs_prompt_error = Some(e),
     }
 }
 
