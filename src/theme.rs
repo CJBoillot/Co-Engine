@@ -60,6 +60,21 @@ pub(crate) mod icon {
     pub(crate) const GAUGE: &str = "\u{eab1}";
     pub(crate) const CPU: &str = "\u{ef8e}";
     pub(crate) const CHECK: &str = "\u{ea5e}";
+    pub(crate) const LIBRARY: &str = "\u{fd4c}";
+    pub(crate) const MUSIC: &str = "\u{eafc}";
+    pub(crate) const BRACES: &str = "\u{ebcc}";
+    pub(crate) const UPLOAD: &str = "\u{eb47}";
+    pub(crate) const MODEL3D: &str = "\u{f032}";
+    pub(crate) const GRID: &str = "\u{edba}";
+    pub(crate) const LIST: &str = "\u{ef40}";
+    pub(crate) const PAUSE: &str = "\u{ed45}";
+    pub(crate) const STOP: &str = "\u{ed4a}";
+    pub(crate) const VOLUME: &str = "\u{eb51}";
+    pub(crate) const VOLUME_MUTE: &str = "\u{eb50}";
+    pub(crate) const BACK10: &str = "\u{faba}";
+    pub(crate) const FWD10: &str = "\u{fac2}";
+    pub(crate) const SKIP_START: &str = "\u{ed48}";
+    pub(crate) const SKIP_END: &str = "\u{ed49}";
 }
 
 /// Register the bundled icon font, appended as a fallback to the default

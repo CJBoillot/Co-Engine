@@ -1,6 +1,6 @@
 [package]
 name = "coengine"
-version = "0.0.21"
+version = "0.0.22"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 pollster = "0.3"
 portable-pty = "0.8"
 rfd = "0.15"
+rodio = "0.22.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
 ureq = "2"

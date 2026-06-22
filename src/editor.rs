@@ -429,14 +429,15 @@ pub(crate) fn move_into(src: &Path, dest_dir: &Path) -> Result<Option<(PathBuf, 
 /// Context-menu items for a folder (or the project root): create inside it, and
 /// — unless it's the root — rename/delete it. Sets `fs_req` on click.
 fn folder_menu(ui: &mut egui::Ui, dir: &Path, is_root: bool, fs_req: &mut Option<FsPrompt>) {
-    if ui.button("New File").clicked() {
+    use crate::theme::icon;
+    if ui.button(format!("{}  New File", icon::FILE_PLUS)).clicked() {
         *fs_req = Some(FsPrompt::NewFile {
             parent: dir.to_path_buf(),
             name: String::new(),
         });
         ui.close_menu();
     }
-    if ui.button("New Folder").clicked() {
+    if ui.button(format!("{}  New Folder", icon::FOLDER_PLUS)).clicked() {
         *fs_req = Some(FsPrompt::NewFolder {
             parent: dir.to_path_buf(),
             name: String::new(),
@@ -445,14 +446,14 @@ fn folder_menu(ui: &mut egui::Ui, dir: &Path, is_root: bool, fs_req: &mut Option
     }
     if !is_root {
         ui.separator();
-        if ui.button("Rename").clicked() {
+        if ui.button(format!("{}  Rename", icon::PENCIL)).clicked() {
             *fs_req = Some(FsPrompt::Rename {
                 target: dir.to_path_buf(),
                 name: file_name_string(dir),
             });
             ui.close_menu();
         }
-        if ui.button("Delete").clicked() {
+        if ui.button(format!("{}  Delete", icon::TRASH)).clicked() {
             *fs_req = Some(FsPrompt::Delete {
                 target: dir.to_path_buf(),
             });
@@ -463,15 +464,16 @@ fn folder_menu(ui: &mut egui::Ui, dir: &Path, is_root: bool, fs_req: &mut Option
 
 /// Context-menu items for a file: create a sibling, rename, or delete it.
 fn file_menu(ui: &mut egui::Ui, path: &Path, fs_req: &mut Option<FsPrompt>) {
+    use crate::theme::icon;
     if let Some(parent) = path.parent() {
-        if ui.button("New File").clicked() {
+        if ui.button(format!("{}  New File", icon::FILE_PLUS)).clicked() {
             *fs_req = Some(FsPrompt::NewFile {
                 parent: parent.to_path_buf(),
                 name: String::new(),
             });
             ui.close_menu();
         }
-        if ui.button("New Folder").clicked() {
+        if ui.button(format!("{}  New Folder", icon::FOLDER_PLUS)).clicked() {
             *fs_req = Some(FsPrompt::NewFolder {
                 parent: parent.to_path_buf(),
                 name: String::new(),
@@ -480,14 +482,14 @@ fn file_menu(ui: &mut egui::Ui, path: &Path, fs_req: &mut Option<FsPrompt>) {
         }
         ui.separator();
     }
-    if ui.button("Rename").clicked() {
+    if ui.button(format!("{}  Rename", icon::PENCIL)).clicked() {
         *fs_req = Some(FsPrompt::Rename {
             target: path.to_path_buf(),
             name: file_name_string(path),
         });
         ui.close_menu();
     }
-    if ui.button("Delete").clicked() {
+    if ui.button(format!("{}  Delete", icon::TRASH)).clicked() {
         *fs_req = Some(FsPrompt::Delete {
             target: path.to_path_buf(),
         });
@@ -565,6 +567,404 @@ pub(crate) fn project_search(root: &Path, query: &str) -> Vec<SearchHit> {
         }
     }
     hits
+}
+
+/// What kind of asset a file is (by extension) — drives the Content Browser's
+/// icon, type label, and whether the engine can currently preview it.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum AssetKind {
+    Image,
+    Model,
+    Audio,
+    Data,
+    Text,
+    Other,
+}
+
+impl AssetKind {
+    pub(crate) fn of(path: &Path) -> AssetKind {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => AssetKind::Image,
+            Some("gltf" | "glb" | "fbx" | "obj") => AssetKind::Model,
+            Some("wav" | "mp3" | "ogg" | "flac") => AssetKind::Audio,
+            Some("json" | "toml" | "yaml" | "yml" | "csv") => AssetKind::Data,
+            Some("txt" | "md" | "markdown" | "rs" | "ron" | "glsl" | "wgsl") => AssetKind::Text,
+            _ => AssetKind::Other,
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AssetKind::Image => "Image",
+            AssetKind::Model => "3D Model",
+            AssetKind::Audio => "Audio",
+            AssetKind::Data => "Data",
+            AssetKind::Text => "Text",
+            AssetKind::Other => "File",
+        }
+    }
+    pub(crate) fn icon(self) -> &'static str {
+        use crate::theme::icon;
+        match self {
+            AssetKind::Image => icon::PHOTO,
+            AssetKind::Model => icon::MODEL3D,
+            AssetKind::Audio => icon::MUSIC,
+            AssetKind::Data => icon::BRACES,
+            AssetKind::Text => icon::FILE,
+            AssetKind::Other => icon::FILE,
+        }
+    }
+    /// Can the engine currently open/preview this asset? (3D models: not yet.)
+    pub(crate) fn previewable(self) -> bool {
+        matches!(
+            self,
+            AssetKind::Image | AssetKind::Data | AssetKind::Text | AssetKind::Audio
+        )
+    }
+    /// Section header title in the Content Browser (plural).
+    pub(crate) fn section_title(self) -> &'static str {
+        match self {
+            AssetKind::Image => "Images",
+            AssetKind::Model => "3D Models",
+            AssetKind::Audio => "Audio",
+            AssetKind::Data => "Data",
+            AssetKind::Text => "Text",
+            AssetKind::Other => "Other",
+        }
+    }
+    /// The file extensions that fall into this category (for the section header).
+    pub(crate) fn extensions(self) -> &'static [&'static str] {
+        match self {
+            AssetKind::Image => &["png", "jpg", "jpeg", "gif", "bmp", "webp"],
+            AssetKind::Model => &["gltf", "glb", "fbx", "obj"],
+            AssetKind::Audio => &["wav", "mp3", "ogg", "flac"],
+            AssetKind::Data => &["json", "toml", "yaml", "yml", "csv"],
+            AssetKind::Text => &["txt", "md", "rs", "ron", "glsl", "wgsl"],
+            AssetKind::Other => &[],
+        }
+    }
+    /// Display order of categories in the browser.
+    pub(crate) const ORDER: [AssetKind; 6] = [
+        AssetKind::Image,
+        AssetKind::Model,
+        AssetKind::Audio,
+        AssetKind::Data,
+        AssetKind::Text,
+        AssetKind::Other,
+    ];
+}
+
+/// Supported import file types, grouped for the dialog + the on-screen hint.
+pub(crate) const IMPORT_GROUPS: &[(&str, &[&str])] = &[
+    ("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp"]),
+    ("3D models", &["gltf", "glb", "fbx", "obj"]),
+    ("Audio", &["wav", "mp3", "ogg", "flac"]),
+    ("Data", &["json", "toml", "yaml", "yml", "csv"]),
+    ("Text", &["txt", "md", "rs", "ron", "glsl", "wgsl"]),
+];
+
+/// The Content Browser tab: a typed, importable view of the project's `assets/`
+/// folder. `import` is set when the user clicks Import; clicking a previewable
+/// asset records it in `open` (the caller opens a viewer tab).
+/// Content Browser view mode.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub(crate) enum ContentView {
+    #[default]
+    Tiles,
+    List,
+}
+
+/// Human-readable file size for the details view.
+fn human_size(path: &Path) -> String {
+    match std::fs::metadata(path).map(|m| m.len()) {
+        Ok(b) if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        Ok(b) if b >= 1 << 10 => format!("{:.1} KB", b as f64 / (1u64 << 10) as f64),
+        Ok(b) => format!("{b} B"),
+        Err(_) => String::new(),
+    }
+}
+
+pub(crate) fn content_browser_ui(
+    ui: &mut egui::Ui,
+    project_root: Option<&Path>,
+    open: &mut Option<PathBuf>,
+    import: &mut bool,
+    fs_req: &mut Option<FsPrompt>,
+    view: &mut ContentView,
+    file_cache: &mut HashMap<PathBuf, FileView>,
+) {
+    let ctx = ui.ctx().clone();
+    egui::TopBottomPanel::top("content_header").show_inside(ui, |ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading("Content");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(format!("{}  Import", crate::theme::icon::UPLOAD))
+                    .on_hover_text("Copy files into the project's assets/ folder")
+                    .clicked()
+                {
+                    *import = true;
+                }
+                ui.separator();
+                // View-mode toggle: tiles (thumbnails) vs details/list.
+                if ui
+                    .selectable_label(
+                        *view == ContentView::List,
+                        egui::RichText::new(crate::theme::icon::LIST).size(16.0),
+                    )
+                    .on_hover_text("Details / list")
+                    .clicked()
+                {
+                    *view = ContentView::List;
+                }
+                if ui
+                    .selectable_label(
+                        *view == ContentView::Tiles,
+                        egui::RichText::new(crate::theme::icon::GRID).size(16.0),
+                    )
+                    .on_hover_text("Tiles / thumbnails")
+                    .clicked()
+                {
+                    *view = ContentView::Tiles;
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("Supported: images · 3D models · audio · data · text")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
+    });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        let Some(root) = project_root else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("No project open").weak());
+            });
+            return;
+        };
+        let assets = root.join("assets");
+        let files = list_project_files(&assets);
+        if files.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("No assets yet.").weak());
+            ui.label(
+                egui::RichText::new("Click Import to add images, 3D models, audio, data, or text.")
+                    .weak()
+                    .small(),
+            );
+            return;
+        }
+        // Lazily fetch an image asset's texture (full image, drawn scaled) as its
+        // thumbnail, reusing the file cache.
+        let mut thumb = |path: &Path| -> Option<egui::TextureHandle> {
+            match file_cache
+                .entry(path.to_path_buf())
+                .or_insert_with(|| load_file_view(&ctx, path))
+            {
+                FileView::Image(t) => Some(t.clone()),
+                _ => None,
+            }
+        };
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for kind in AssetKind::ORDER {
+                    let group: Vec<&PathBuf> =
+                        files.iter().filter(|p| AssetKind::of(p) == kind).collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    // Section header: category + count (left) + its file types (right).
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}  {}", kind.icon(), kind.section_title()))
+                                .strong()
+                                .color(ACCENT_GOLD),
+                        );
+                        ui.label(egui::RichText::new(format!("({})", group.len())).weak().small());
+                        let exts = kind.extensions();
+                        if !exts.is_empty() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(exts.join(" · ")).weak().small());
+                            });
+                        }
+                    });
+                    ui.separator();
+                    ui.add_space(2.0);
+
+                    match *view {
+                        ContentView::Tiles => {
+                            ui.horizontal_wrapped(|ui| {
+                                for path in group {
+                                    let name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let tex = if kind == AssetKind::Image {
+                                        thumb(path)
+                                    } else {
+                                        None
+                                    };
+                                    let resp = asset_browser_card(ui, &name, kind, tex.as_ref());
+                                    if resp.clicked() && kind.previewable() {
+                                        *open = Some(path.clone());
+                                    }
+                                    asset_card_menu(ui, &resp, path, kind, open, fs_req);
+                                }
+                            });
+                        }
+                        ContentView::List => {
+                            for path in group {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    let col = if kind.previewable() {
+                                        ACCENT_GOLD
+                                    } else {
+                                        ui.visuals().weak_text_color()
+                                    };
+                                    let resp = ui.selectable_label(
+                                        false,
+                                        egui::RichText::new(format!("{}  {name}", kind.icon()))
+                                            .color(col),
+                                    );
+                                    if resp.clicked() && kind.previewable() {
+                                        *open = Some(path.clone());
+                                    }
+                                    asset_card_menu(ui, &resp, path, kind, open, fs_req);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(human_size(path)).weak().small(),
+                                            );
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                egui::RichText::new(kind.label()).weak().small(),
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+/// Shared right-click menu (Open / Delete) for an asset row or card.
+fn asset_card_menu(
+    _ui: &egui::Ui,
+    resp: &egui::Response,
+    path: &Path,
+    kind: AssetKind,
+    open: &mut Option<PathBuf>,
+    fs_req: &mut Option<FsPrompt>,
+) {
+    resp.context_menu(|ui| {
+        if kind.previewable()
+            && ui
+                .button(format!("{}  Open", crate::theme::icon::EYE))
+                .clicked()
+        {
+            *open = Some(path.to_path_buf());
+            ui.close_menu();
+        }
+        if ui
+            .button(format!("{}  Delete", crate::theme::icon::TRASH))
+            .clicked()
+        {
+            *fs_req = Some(FsPrompt::Delete {
+                target: path.to_path_buf(),
+            });
+            ui.close_menu();
+        }
+    });
+}
+
+/// One Content Browser tile: image thumbnail (or typed icon) + name + type tag.
+/// Returns the card response (click to open, right-click for the menu).
+fn asset_browser_card(
+    ui: &mut egui::Ui,
+    name: &str,
+    kind: AssetKind,
+    thumb: Option<&egui::TextureHandle>,
+) -> egui::Response {
+    let previewable = kind.previewable();
+    let size = egui::vec2(104.0, 116.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hov = resp.hovered();
+    let border = if hov && previewable {
+        ACCENT_GOLD
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke.color
+    };
+    let icon_col = if previewable {
+        ACCENT_GOLD
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let thumb_bg = ui.visuals().extreme_bg_color;
+    let p = ui.painter();
+    p.rect(rect, crate::theme::RADIUS, ui.visuals().faint_bg_color, egui::Stroke::new(0.5, border));
+    let thumb_rect =
+        egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(size.x - 16.0, 60.0));
+    p.rect_filled(thumb_rect, crate::theme::RADIUS, thumb_bg);
+    if let Some(tex) = thumb {
+        // Aspect-fit the image inside the thumbnail box.
+        let img = tex.size_vec2();
+        let ar = img.x / img.y.max(1.0);
+        let box_ar = thumb_rect.width() / thumb_rect.height().max(1.0);
+        let sz = if ar > box_ar {
+            egui::vec2(thumb_rect.width(), thumb_rect.width() / ar)
+        } else {
+            egui::vec2(thumb_rect.height() * ar, thumb_rect.height())
+        };
+        let r = egui::Rect::from_center_size(thumb_rect.center(), sz * 0.92);
+        p.image(
+            tex.id(),
+            r,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        p.text(
+            thumb_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            kind.icon(),
+            egui::FontId::proportional(28.0),
+            icon_col,
+        );
+    }
+    p.text(
+        egui::pos2(rect.center().x, thumb_rect.bottom() + 7.0),
+        egui::Align2::CENTER_TOP,
+        name,
+        egui::FontId::proportional(11.5),
+        ui.visuals().text_color(),
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.bottom() - 8.0),
+        egui::Align2::CENTER_BOTTOM,
+        kind.label(),
+        egui::FontId::proportional(10.5),
+        ui.visuals().weak_text_color(),
+    );
+    resp.on_hover_text(if previewable {
+        "Open · right-click for more"
+    } else {
+        "Imported — preview coming · right-click for more"
+    })
 }
 
 /// Every file path under `root` (skipping `.git`, `target`, `node_modules`),

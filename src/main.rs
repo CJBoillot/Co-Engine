@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.21";
+pub(crate) const CO_VERSION: &str = "0.0.22";
 
 mod ai;
 use ai::*;
@@ -93,6 +93,8 @@ pub(crate) enum DockTab {
     Assets,
     /// Resource monitor: memory / performance / scene stats for the designer.
     Resources,
+    /// Content Browser: typed, importable view of the project's assets.
+    Content,
     /// A file viewer opened from the Explorer; the tab is titled by file name and
     /// shows the file's text/code, or the image if it's an image.
     File(PathBuf),
@@ -171,6 +173,10 @@ struct UiState {
     palette_focus: bool,
     /// Asset-catalog search box text.
     asset_query: String,
+    /// One-shot: Content Browser Import clicked (serviced in `update`).
+    content_import: bool,
+    /// Content Browser view mode (tiles vs details/list).
+    content_view: ContentView,
 }
 
 impl Default for UiState {
@@ -214,6 +220,8 @@ impl Default for UiState {
             palette_query: String::new(),
             palette_focus: false,
             asset_query: String::new(),
+            content_import: false,
+            content_view: ContentView::default(),
         }
     }
 }
@@ -232,6 +240,7 @@ fn dock_tab_label(tab: &DockTab) -> String {
         DockTab::Search => "Search".to_string(),
         DockTab::Assets => "Assets".to_string(),
         DockTab::Resources => "Resources".to_string(),
+        DockTab::Content => "Content".to_string(),
         DockTab::File(p) => p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -676,8 +685,8 @@ fn ring_basis(axis: usize) -> (glam::Vec3, glam::Vec3) {
     }
 }
 
-/// Local anchor direction of each axis's ball handle, in the object's frame.
-/// The ball is rigidly attached here (so it moves with the whole object).
+/// Anchor direction of each axis's ball handle on its (world-aligned) ring —
+/// the ring's first basis vector, so the knob sits on the world ring.
 const ROT_ANCHOR: [glam::Vec3; 3] = [glam::Vec3::Y, glam::Vec3::Z, glam::Vec3::X];
 
 /// The object's rotation as a quaternion (euler degrees → quat).
@@ -690,10 +699,11 @@ fn obj_quat(rot_deg: glam::Vec3) -> glam::Quat {
     )
 }
 
-/// World position of the ball handle for `axis` — its local anchor rigidly
-/// transformed by the object's full rotation (so it sticks to the object).
-fn rotate_ball_world(axis: usize, center: glam::Vec3, rot_deg: glam::Vec3) -> glam::Vec3 {
-    center + obj_quat(rot_deg) * (ROT_ANCHOR[axis] * GIZMO_AXIS_LEN)
+/// World position of the ball handle for `axis` — fixed on the world-aligned ring
+/// (the rotate gizmo stays grid-aligned, like the move arrows; the object spins
+/// inside it).
+fn rotate_ball_world(axis: usize, center: glam::Vec3) -> glam::Vec3 {
+    center + ROT_ANCHOR[axis] * GIZMO_AXIS_LEN
 }
 
 /// Project to screen + return clip-space `w` (a camera-distance proxy for depth).
@@ -718,19 +728,18 @@ fn dim(c: egui::Color32, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-/// Draw the rotate gizmo: three rings centered on the object and tilted with it
-/// (object-local), each carrying a ball handle. The half of each ring behind the
-/// object is dimmed so the object reads as occluding it. While dragging
-/// (`active = Some`), only that axis is shown.
+/// Draw the rotate gizmo: three rings centered on the object and aligned to the
+/// world axes (grid-aligned, like the move arrows — the object spins inside the
+/// rings), each carrying a ball handle. The half of each ring behind the object
+/// is dimmed so the object reads as occluding it. While dragging (`active =
+/// Some`), only that axis is shown.
 fn draw_rotate_gizmo(
     painter: &egui::Painter,
     rect: egui::Rect,
     view_proj: glam::Mat4,
     obj_pos: glam::Vec3,
-    rot_deg: glam::Vec3,
     active: Option<usize>,
 ) {
-    let q = obj_quat(rot_deg);
     let center_depth = project_depth(obj_pos, view_proj, rect).map_or(1.0, |(_, d)| d);
     for axis in 0..3 {
         if active.is_some() && active != Some(axis) {
@@ -738,8 +747,7 @@ fn draw_rotate_gizmo(
         }
         let color = AXIS_COLORS[axis];
         let hot = active == Some(axis);
-        let (ul, vl) = ring_basis(axis);
-        let (u, v) = (q * ul, q * vl);
+        let (u, v) = ring_basis(axis);
         let mut prev: Option<(egui::Pos2, f32)> = None;
         for i in 0..=72 {
             let a = i as f32 / 72.0 * std::f32::consts::TAU;
@@ -752,8 +760,8 @@ fn draw_rotate_gizmo(
             }
             prev = cur;
         }
-        // Ball handle, stuck to the object.
-        if let Some((b, bd)) = project_depth(obj_pos + q * (ROT_ANCHOR[axis] * GIZMO_AXIS_LEN), view_proj, rect) {
+        // Ball handle on the world-aligned ring.
+        if let Some((b, bd)) = project_depth(rotate_ball_world(axis, obj_pos), view_proj, rect) {
             let behind = bd > center_depth + 0.02;
             let r = if hot { 11.0 } else { 8.5 };
             painter.circle_filled(b, r, if behind { dim(color, 120) } else { color });
@@ -896,6 +904,10 @@ struct EngineTabs<'a> {
     find_query: Option<String>,
     /// Asset-catalog search box text.
     asset_query: &'a mut String,
+    /// Set when the Content Browser's Import button is clicked.
+    content_import: &'a mut bool,
+    /// Content Browser view mode (tiles vs list).
+    content_view: &'a mut ContentView,
 }
 
 impl TabViewer for EngineTabs<'_> {
@@ -990,6 +1002,17 @@ impl TabViewer for EngineTabs<'_> {
             }
             DockTab::Resources => {
                 resource_monitor_ui(ui, self.scene.cubes.len());
+            }
+            DockTab::Content => {
+                content_browser_ui(
+                    ui,
+                    self.project_root.as_deref(),
+                    self.open_file_req,
+                    self.content_import,
+                    self.fs_req,
+                    self.content_view,
+                    self.file_cache,
+                );
             }
             DockTab::File(path) => {
                 let lang = language_for(path);
@@ -1106,6 +1129,8 @@ fn build_ui(
     close_doc: &mut Option<usize>,
     open_doc_req: &mut Option<PathBuf>,
     close_docs_under: &mut Option<PathBuf>,
+    audio_status: AudioStatus,
+    audio_req: &mut Option<AudioReq>,
     scene_rect_out: &mut Option<egui::Rect>,
     toolbar_rect_out: &mut Option<egui::Rect>,
 ) {
@@ -1371,6 +1396,7 @@ fn build_ui(
                 (DockTab::Explorer, theme::icon::FILES, "Explorer"),
                 (DockTab::Search, theme::icon::SEARCH, "Search"),
                 (DockTab::Git, theme::icon::GIT_BRANCH, "Git"),
+                (DockTab::Content, theme::icon::LIBRARY, "Content"),
                 (DockTab::Assets, theme::icon::BOX, "Assets"),
                 (DockTab::Resources, theme::icon::GAUGE, "Resources"),
                 (DockTab::AiChat, theme::icon::CHAT, "AI Chat"),
@@ -1485,6 +1511,12 @@ fn build_ui(
             );
         });
     } else if let Some(DocSource::File(path)) = active_doc_source.clone() {
+        if AssetKind::of(&path) == AssetKind::Audio {
+            // Audio document: a media player (no text toolbar).
+            egui::CentralPanel::default().show(ctx, |ui| {
+                audio_player_ui(ui, &path, &audio_status, audio_req);
+            });
+        } else {
         // File document: a focused editor with its own type toolbar and only the
         // panels that object needs — no world panels, no inner dock tab bar.
         let dirty = file_cache.get(&path).is_some_and(FileView::is_dirty);
@@ -1540,6 +1572,7 @@ fn build_ui(
                 fq,
             );
         });
+        }
     } else {
         let mut viewer = EngineTabs {
             chat,
@@ -1578,6 +1611,8 @@ fn build_ui(
                 None
             },
             asset_query: &mut ui_state.asset_query,
+            content_import: &mut ui_state.content_import,
+            content_view: &mut ui_state.content_view,
         };
         DockArea::new(dock_state)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -1773,8 +1808,7 @@ fn build_ui(
                     draw_translate_gizmo(&painter, rect, view_proj, obj_pos, gizmo_axis);
                 }
                 GizmoMode::Rotate => {
-                    let rot = inspector.map(|e| e.rotation).unwrap_or(glam::Vec3::ZERO);
-                    draw_rotate_gizmo(&painter, rect, view_proj, obj_pos, rot, gizmo_axis);
+                    draw_rotate_gizmo(&painter, rect, view_proj, obj_pos, gizmo_axis);
                     // Live angle readout while dragging a ring.
                     if let (Some(ax), Some(e), Some(c)) = (
                         gizmo_axis,
@@ -2430,6 +2464,7 @@ fn command_palette(
         (DockTab::Explorer, theme::icon::FILES, "Explorer"),
         (DockTab::Search, theme::icon::SEARCH, "Search"),
         (DockTab::Git, theme::icon::GIT_BRANCH, "Git"),
+        (DockTab::Content, theme::icon::LIBRARY, "Content"),
         (DockTab::Assets, theme::icon::BOX, "Assets"),
         (DockTab::Resources, theme::icon::GAUGE, "Resources"),
         (DockTab::AiChat, theme::icon::CHAT, "AI Chat"),
@@ -2648,6 +2683,351 @@ fn metric_card(ui: &mut egui::Ui, label: &str, value: &str) {
         egui::FontId::proportional(18.0),
         ui.visuals().text_color(),
     );
+}
+
+/// Seconds → "m:ss".
+fn fmt_time(secs: f32) -> String {
+    let s = secs.max(0.0) as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// A playback-speed multiplier without trailing zeros: 1.0 → "1", 1.5 → "1.5".
+fn trim_speed(s: f32) -> String {
+    let t = format!("{s:.2}");
+    t.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Bytes → human-readable size.
+fn fmt_size(b: u64) -> String {
+    if b >= 1 << 20 {
+        format!("{:.1} MB", b as f64 / (1u64 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.1} KB", b as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{b} B")
+    }
+}
+
+/// One label/value row in the media details grid.
+fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(egui::RichText::new(label).weak().small());
+    ui.label(egui::RichText::new(value).small());
+    ui.end_row();
+}
+
+/// The audio document's player — a thin wrapper over the reusable media player.
+fn audio_player_ui(ui: &mut egui::Ui, path: &Path, status: &AudioStatus, req: &mut Option<AudioReq>) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_uppercase())
+        .unwrap_or_default();
+    let is_current = status.path.as_deref() == Some(path);
+    let subtitle = if is_current && status.total > 0.0 {
+        format!("{ext}  ·  {}", fmt_time(status.total))
+    } else {
+        ext
+    };
+    media_player_ui(ui, path, &name, &subtitle, theme::icon::MUSIC, None, status, req);
+}
+
+/// A frameless, tinted transport icon button (skip/stop). Returns the response.
+fn media_icon_btn(ui: &mut egui::Ui, glyph: &str, hover: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
+    let col = if resp.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(20.0),
+        col,
+    );
+    resp.on_hover_text(hover)
+}
+
+/// World-class media player UI, shared by audio (and later video / animation):
+/// large artwork (icon or `frame` texture), title/subtitle, a draggable scrub bar
+/// with times, a circular play/pause with skip ±10s and stop, and a volume slider.
+/// All control intents flow out via `req`.
+#[allow(clippy::too_many_arguments)]
+fn media_player_ui(
+    ui: &mut egui::Ui,
+    path: &Path,
+    title: &str,
+    subtitle: &str,
+    glyph: &str,
+    frame: Option<&egui::TextureHandle>,
+    status: &AudioStatus,
+    req: &mut Option<AudioReq>,
+) {
+    let is_current = status.path.as_deref() == Some(path);
+    let ended = is_current && status.ended;
+    let playing = is_current && status.playing;
+    let total = if is_current { status.total } else { 0.0 };
+    let pos = if !is_current {
+        0.0
+    } else if ended {
+        total // show the bar as complete; Play restarts from 0
+    } else {
+        status.pos
+    };
+    let gold = ACCENT_GOLD;
+    let gold_hot = egui::Color32::from_rgb(234, 172, 74);
+    let dark = egui::Color32::from_rgb(22, 23, 27);
+
+    // ---- Details (always open) on the right, level with the hero card ----
+    let size = std::fs::metadata(path).map(|m| m.len()).ok();
+    egui::SidePanel::right("media_details")
+        .resizable(false)
+        .exact_width(300.0)
+        .show_inside(ui, |ui| {
+            ui.add_space(20.0);
+            ui.heading("Details");
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(6.0);
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_uppercase())
+                .unwrap_or_default();
+            egui::Grid::new("media_details_grid")
+                .num_columns(2)
+                .spacing([14.0, 7.0])
+                .show(ui, |ui| {
+                    detail_row(ui, "Format", &ext);
+                    detail_row(
+                        ui,
+                        "Length",
+                        &if total > 0.0 { fmt_time(total) } else { "—".into() },
+                    );
+                    if let Some(b) = size {
+                        detail_row(ui, "Size", &fmt_size(b));
+                    }
+                    detail_row(ui, "Used in", "—");
+                });
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Path").weak().small());
+            ui.label(egui::RichText::new(path.display().to_string()).small());
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Usage tracking (where this asset is used) is coming soon.")
+                    .weak()
+                    .small(),
+            );
+        });
+
+    let avail = ui.available_size();
+    let card_w = avail.x.min(560.0).max(280.0);
+
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(card_w);
+        ui.add_space((avail.y * 0.06).clamp(8.0, 48.0));
+
+        // ---- Artwork ----
+        let art = card_w.min(300.0);
+        let (arect, _) = ui.allocate_exact_size(egui::vec2(card_w, art), egui::Sense::hover());
+        let sq = egui::Rect::from_center_size(arect.center(), egui::vec2(art, art));
+        {
+            let p = ui.painter();
+            p.rect(
+                sq,
+                crate::theme::RADIUS_LG,
+                ui.visuals().extreme_bg_color,
+                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+            );
+            if let Some(tex) = frame {
+                let img = tex.size_vec2();
+                let ar = img.x / img.y.max(1.0);
+                let bar = sq.width() / sq.height().max(1.0);
+                let s = if ar > bar {
+                    egui::vec2(sq.width(), sq.width() / ar)
+                } else {
+                    egui::vec2(sq.height() * ar, sq.height())
+                };
+                let r = egui::Rect::from_center_size(sq.center(), s * 0.98);
+                p.image(
+                    tex.id(),
+                    r,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                p.text(
+                    sq.center(),
+                    egui::Align2::CENTER_CENTER,
+                    glyph,
+                    egui::FontId::proportional(88.0),
+                    gold,
+                );
+            }
+        }
+
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new(title).size(20.0).strong());
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(subtitle).weak());
+        ui.add_space(18.0);
+
+        // ---- Scrub bar ----
+        let (srect, sresp) =
+            ui.allocate_exact_size(egui::vec2(card_w, 20.0), egui::Sense::click_and_drag());
+        let cy = srect.center().y;
+        let x0 = srect.left() + 4.0;
+        let x1 = srect.right() - 4.0;
+        let w = (x1 - x0).max(1.0);
+        // While dragging, the bar follows the cursor; otherwise the playback pos.
+        let mut frac = if total > 0.0 { (pos / total).clamp(0.0, 1.0) } else { 0.0 };
+        if sresp.dragged() || sresp.drag_stopped() {
+            if let Some(cp) = sresp.interact_pointer_pos() {
+                frac = ((cp.x - x0) / w).clamp(0.0, 1.0);
+            }
+        }
+        let phx = x0 + frac * w;
+        {
+            let p = ui.painter();
+            p.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, cy - 2.5), egui::pos2(x1, cy + 2.5)),
+                3.0,
+                ui.visuals().widgets.inactive.bg_fill,
+            );
+            p.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, cy - 2.5), egui::pos2(phx, cy + 2.5)),
+                3.0,
+                gold,
+            );
+            let knob = if sresp.hovered() || sresp.dragged() { 7.0 } else { 5.0 };
+            p.circle_filled(egui::pos2(phx, cy), knob, gold);
+        }
+        if is_current && total > 0.0 {
+            // Drag = silent scrub (pause → seek → resume on release); click = jump.
+            if sresp.drag_started() {
+                *req = Some(AudioReq::ScrubStart);
+            } else if sresp.drag_stopped() {
+                *req = Some(AudioReq::ScrubEnd(frac * total));
+            } else if sresp.dragged() {
+                *req = Some(AudioReq::ScrubTo(frac * total));
+            } else if sresp.clicked() {
+                if let Some(cp) = sresp.interact_pointer_pos() {
+                    *req = Some(AudioReq::Seek(((cp.x - x0) / w).clamp(0.0, 1.0) * total));
+                }
+            }
+        }
+        // Times (elapsed left, total right) across the full card width.
+        ui.allocate_ui_with_layout(
+            egui::vec2(card_w, 16.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(egui::RichText::new(fmt_time(pos)).small().weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(fmt_time(total)).small().weak());
+                });
+            },
+        );
+        ui.add_space(12.0);
+
+        // ---- Transport: rewind-to-start · play/pause · skip-to-end, centered
+        // under the hero; volume + settings (speed) floated to the right. ----
+        let core_w = 40.0 + 12.0 + 60.0 + 12.0 + 40.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(card_w, 64.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(((card_w - core_w) * 0.5).max(0.0));
+                if media_icon_btn(ui, theme::icon::SKIP_START, "Rewind to start").clicked()
+                    && is_current
+                {
+                    *req = Some(AudioReq::Seek(0.0));
+                }
+                ui.add_space(12.0);
+                let (brect, bresp) =
+                    ui.allocate_exact_size(egui::vec2(60.0, 60.0), egui::Sense::click());
+                {
+                    let p = ui.painter();
+                    p.circle_filled(brect.center(), 28.0, if bresp.hovered() { gold_hot } else { gold });
+                    p.text(
+                        brect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if playing { theme::icon::PAUSE } else { theme::icon::PLAY },
+                        egui::FontId::proportional(26.0),
+                        dark,
+                    );
+                }
+                if bresp.clicked() {
+                    // A finished track restarts from the top; otherwise toggle.
+                    *req = Some(if is_current && !ended {
+                        AudioReq::Toggle
+                    } else {
+                        AudioReq::Play(path.to_path_buf())
+                    });
+                }
+                ui.add_space(12.0);
+                if media_icon_btn(ui, theme::icon::SKIP_END, "Skip to end").clicked()
+                    && is_current
+                    && total > 0.0
+                {
+                    *req = Some(AudioReq::Seek(total));
+                }
+                // Volume + settings (playback speed), floated to the right.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button(theme::icon::SETTINGS, |ui| {
+                        ui.label(egui::RichText::new("Playback speed").weak().small());
+                        for s in [0.5f32, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                            if ui
+                                .selectable_label(
+                                    (status.speed - s).abs() < 0.01,
+                                    format!("{}×", trim_speed(s)),
+                                )
+                                .clicked()
+                            {
+                                *req = Some(AudioReq::Speed(s));
+                                ui.close_menu();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Settings");
+                    ui.add_space(2.0);
+                    let vicon = if status.volume <= 0.001 {
+                        theme::icon::VOLUME_MUTE
+                    } else {
+                        theme::icon::VOLUME
+                    };
+                    ui.menu_button(vicon, |ui| {
+                        ui.set_min_width(46.0);
+                        ui.vertical_centered(|ui| {
+                            let mut v = status.volume;
+                            if ui
+                                .add(egui::Slider::new(&mut v, 0.0..=1.0).vertical().show_value(false))
+                                .changed()
+                            {
+                                *req = Some(AudioReq::Volume(v));
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{}%", (v * 100.0).round() as i32))
+                                    .small()
+                                    .weak(),
+                            );
+                        });
+                    })
+                    .response
+                    .on_hover_text("Volume");
+                });
+            },
+        );
+        ui.add_space(8.0);
+    });
+    if playing {
+        ui.ctx().request_repaint();
+    }
 }
 
 /// The Asset Catalog tab: a WoW-housing-style palette of 3D objects to drop into
@@ -3052,6 +3432,59 @@ struct Document {
     source: DocSource,
 }
 
+/// A request from the media-player UI, applied to `State.audio` after the frame.
+enum AudioReq {
+    Play(PathBuf),
+    Toggle,
+    Seek(f32),
+    Volume(f32),
+    Speed(f32),
+    /// Begin scrubbing: pause (and reload the source if the track had ended) so
+    /// dragging the bar is silent and seekable.
+    ScrubStart,
+    /// Seek to this position while scrubbing (audio stays paused).
+    ScrubTo(f32),
+    /// Finish scrubbing: seek to the final position and resume playback.
+    ScrubEnd(f32),
+}
+
+/// A snapshot of media playback for the player UI (passed into `build_ui`).
+#[derive(Clone)]
+struct AudioStatus {
+    path: Option<PathBuf>,
+    playing: bool,
+    pos: f32,
+    total: f32,
+    volume: f32,
+    speed: f32,
+    /// The current track finished (or was seeked past the end) — Play should
+    /// restart it from the beginning rather than toggle pause.
+    ended: bool,
+}
+
+impl Default for AudioStatus {
+    fn default() -> Self {
+        Self {
+            path: None,
+            playing: false,
+            pos: 0.0,
+            total: 0.0,
+            volume: 1.0,
+            speed: 1.0,
+            ended: false,
+        }
+    }
+}
+
+/// The engine's audio output + current track (lazily opened on first play).
+struct AudioPlayer {
+    /// Kept alive to hold the OS audio stream open.
+    _handle: rodio::MixerDeviceSink,
+    player: rodio::Player,
+    path: Option<PathBuf>,
+    total: Option<std::time::Duration>,
+}
+
 // ---------------------------------------------------------------------------
 // Renderer state
 // ---------------------------------------------------------------------------
@@ -3142,11 +3575,16 @@ struct State {
     /// Transient scene toast: (message, deadline). Shown in the 3D viewport until
     /// the deadline; set on camera-mode switch, project save, etc.
     toast: Option<(String, Instant)>,
+    /// Audio playback (lazily opened the first time a sound is played).
+    audio: Option<AudioPlayer>,
     /// Which gizmo axis (0=X,1=Y,2=Z) is being dragged, if any.
     gizmo_drag: Option<usize>,
     /// Scale-drag start state: uniform scale + cursor distance from center at grab.
     gizmo_scale_start: f32,
     gizmo_scale_dist0: f32,
+    /// Last cursor angle (radians) on the active rotate ring, for incremental
+    /// world-axis rotation while dragging.
+    gizmo_rot_prev: f32,
     /// Whether Shift is held (fast keyboard nudge).
     shift_down: bool,
     mouse_left_down: bool,
@@ -3459,8 +3897,10 @@ impl State {
             toolbar_rect: None,
             gizmo_drag: None,
             toast: None,
+            audio: None,
             gizmo_scale_start: 1.0,
             gizmo_scale_dist0: 1.0,
+            gizmo_rot_prev: 0.0,
             shift_down: false,
             mouse_left_down: false,
             mouse_right_down: false,
@@ -3567,6 +4007,180 @@ impl State {
             source: DocSource::File(path),
         });
         self.active_doc = self.extra_docs.len(); // Scene is 0, so the new doc is len.
+    }
+
+    /// Import files into the project's `assets/` folder via a native file dialog
+    /// filtered to the supported types. Copies the chosen files; toasts the count.
+    fn import_assets(&mut self) {
+        let Some(proj) = self.project_path.clone() else {
+            self.toast = Some((
+                "Open a project first to import assets".to_string(),
+                Instant::now() + Duration::from_millis(1800),
+            ));
+            return;
+        };
+        let assets = proj.join("assets");
+        let all: Vec<&str> = IMPORT_GROUPS.iter().flat_map(|(_, e)| e.iter().copied()).collect();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Import assets")
+            .add_filter("All supported", &all);
+        for (name, exts) in IMPORT_GROUPS {
+            dialog = dialog.add_filter(*name, exts);
+        }
+        if let Some(files) = dialog.pick_files() {
+            let _ = std::fs::create_dir_all(&assets);
+            let mut n = 0usize;
+            for f in files {
+                if let Some(name) = f.file_name() {
+                    if std::fs::copy(&f, assets.join(name)).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+            self.toast = Some((
+                format!("Imported {n} asset(s) → assets/"),
+                Instant::now() + Duration::from_millis(1800),
+            ));
+            self.project_dirty = true;
+        }
+    }
+
+    /// Play an audio file (opening the audio device on first use). Replaces any
+    /// currently-playing track.
+    fn audio_play(&mut self, path: PathBuf) {
+        use rodio::Source;
+        if self.audio.is_none() {
+            match rodio::DeviceSinkBuilder::open_default_sink() {
+                Ok(handle) => {
+                    let player = rodio::Player::connect_new(handle.mixer());
+                    self.audio = Some(AudioPlayer {
+                        _handle: handle,
+                        player,
+                        path: None,
+                        total: None,
+                    });
+                }
+                Err(e) => {
+                    self.toast = Some((
+                        format!("No audio device: {e}"),
+                        Instant::now() + Duration::from_millis(2200),
+                    ));
+                    return;
+                }
+            }
+        }
+        let ap = self.audio.as_mut().expect("audio present");
+        ap.player.clear();
+        match std::fs::File::open(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|f| rodio::Decoder::try_from(f).map_err(|e| e.to_string()))
+        {
+            Ok(dec) => {
+                ap.total = dec.total_duration();
+                ap.player.append(dec);
+                ap.player.play();
+                ap.path = Some(path);
+            }
+            Err(e) => {
+                self.toast = Some((
+                    format!("Couldn't play audio: {e}"),
+                    Instant::now() + Duration::from_millis(2200),
+                ));
+            }
+        }
+    }
+
+    /// Toggle play/pause on the current track.
+    fn audio_toggle(&mut self) {
+        if let Some(ap) = &self.audio {
+            if ap.player.is_paused() {
+                ap.player.play();
+            } else {
+                ap.player.pause();
+            }
+        }
+    }
+
+    /// Re-append the current track's decoder if the sink has drained (track ended),
+    /// so it can be sought/replayed. Leaves play/pause state to the caller.
+    fn audio_reload_if_empty(&mut self) {
+        use rodio::Source;
+        if let Some(ap) = &mut self.audio {
+            if ap.player.empty() {
+                if let Some(path) = ap.path.clone() {
+                    if let Ok(dec) = std::fs::File::open(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|f| rodio::Decoder::try_from(f).map_err(|e| e.to_string()))
+                    {
+                        ap.total = dec.total_duration();
+                        ap.player.append(dec);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seek the current track to `secs` (reloading first if it had ended).
+    fn audio_seek(&mut self, secs: f32) {
+        self.audio_reload_if_empty();
+        if let Some(ap) = &self.audio {
+            let _ = ap.player.try_seek(Duration::from_secs_f32(secs.max(0.0)));
+            ap.player.play();
+        }
+    }
+
+    /// Begin scrubbing: ensure a source exists, then pause so dragging is silent.
+    fn audio_scrub_start(&mut self) {
+        self.audio_reload_if_empty();
+        if let Some(ap) = &self.audio {
+            ap.player.pause();
+        }
+    }
+
+    /// Seek to `secs` during a scrub (audio remains paused).
+    fn audio_scrub_to(&mut self, secs: f32) {
+        if let Some(ap) = &self.audio {
+            let _ = ap.player.try_seek(Duration::from_secs_f32(secs.max(0.0)));
+        }
+    }
+
+    /// Finish scrubbing: seek to the final position and resume playback.
+    fn audio_scrub_end(&mut self, secs: f32) {
+        self.audio_reload_if_empty();
+        if let Some(ap) = &self.audio {
+            let _ = ap.player.try_seek(Duration::from_secs_f32(secs.max(0.0)));
+            ap.player.play();
+        }
+    }
+
+    /// Set playback volume (0.0–1.0).
+    fn audio_volume(&mut self, v: f32) {
+        if let Some(ap) = &self.audio {
+            ap.player.set_volume(v.clamp(0.0, 1.0));
+        }
+    }
+
+    /// Set playback speed (e.g. 0.5–2.0×).
+    fn audio_speed(&mut self, s: f32) {
+        if let Some(ap) = &self.audio {
+            ap.player.set_speed(s.clamp(0.25, 3.0));
+        }
+    }
+
+    /// A snapshot of audio state for the player UI.
+    fn audio_status(&self) -> AudioStatus {
+        match &self.audio {
+            Some(ap) => AudioStatus {
+                path: ap.path.clone(),
+                playing: ap.path.is_some() && !ap.player.is_paused() && !ap.player.empty(),
+                pos: ap.player.get_pos().as_secs_f32(),
+                total: ap.total.map(|d| d.as_secs_f32()).unwrap_or(0.0),
+                volume: ap.player.volume(),
+                speed: ap.player.speed(),
+                ended: ap.path.is_some() && ap.player.empty(),
+            },
+            None => AudioStatus::default(),
+        }
     }
 
     /// Open object (entity) `id` as its own document tab (or focus it if open).
@@ -3779,11 +4393,10 @@ impl State {
                 }
             }
             GizmoMode::Rotate => {
-                // Hit-test the ball handle on each ring.
-                let rot = self.entities[i].rotation;
+                // Hit-test the ball handle on each world-aligned ring.
                 let radius = 22.0 * ppp;
                 for axis in 0..3 {
-                    if let Some(b) = self.project_world(rotate_ball_world(axis, obj, rot)) {
+                    if let Some(b) = self.project_world(rotate_ball_world(axis, obj)) {
                         let d = ((b.0 - cursor.0).powi(2) + (b.1 - cursor.1).powi(2)).sqrt();
                         if d <= radius && best.map_or(true, |(_, bd)| d < bd) {
                             best = Some((axis, d));
@@ -3814,18 +4427,23 @@ impl State {
                 self.entities[i].pos += dir * (along * GIZMO_AXIS_LEN / slen);
             }
             GizmoMode::Rotate => {
-                // Rotate about the object's LOCAL axis so its (rigidly-attached)
-                // ball follows the cursor along its tilted ring; store back as euler.
-                let q = obj_quat(self.entities[i].rotation);
-                let (ul, vl) = ring_basis(ax);
-                let (u, v) = (q * ul, q * vl);
-                let ballvec = q * (ROT_ANCHOR[ax] * GIZMO_AXIS_LEN);
-                let alpha = ballvec.dot(v).atan2(ballvec.dot(u));
+                // Rotate about the WORLD axis (the ring is world-aligned, like the
+                // move arrows): apply the change in cursor angle around the ring as a
+                // world-space rotation, then store back as euler.
                 let Some(phi) = self.cursor_ring_angle(ax) else {
                     return;
                 };
-                let local_axis = [Vec3::X, Vec3::Y, Vec3::Z][ax];
-                let qnew = q * Quat::from_axis_angle(local_axis, phi - alpha);
+                let mut delta = phi - self.gizmo_rot_prev;
+                // Shortest way around the ring (handle the ±π wrap).
+                if delta > std::f32::consts::PI {
+                    delta -= std::f32::consts::TAU;
+                } else if delta < -std::f32::consts::PI {
+                    delta += std::f32::consts::TAU;
+                }
+                self.gizmo_rot_prev = phi;
+                let world_axis = [Vec3::X, Vec3::Y, Vec3::Z][ax];
+                let q = obj_quat(self.entities[i].rotation);
+                let qnew = Quat::from_axis_angle(world_axis, delta) * q;
                 let (ex, ey, ez) = qnew.to_euler(EulerRot::XYZ);
                 self.entities[i].rotation =
                     Vec3::new(ex.to_degrees(), ey.to_degrees(), ez.to_degrees());
@@ -3848,15 +4466,14 @@ impl State {
     }
 
     /// Angle (radians) of the cursor's ray-vs-ring-plane hit point, measured in
-    /// the object-tilted ring basis — i.e. where on `axis`'s ring the cursor points.
+    /// the world-aligned ring basis — i.e. where on `axis`'s world ring the cursor
+    /// points.
     fn cursor_ring_angle(&self, axis: usize) -> Option<f32> {
         let i = self.selected?;
         let e = self.entities.get(i)?;
         let obj = e.pos;
-        let q = obj_quat(e.rotation);
-        let (ul, vl) = ring_basis(axis);
-        let (u, v) = (q * ul, q * vl);
-        let normal = q * [Vec3::X, Vec3::Y, Vec3::Z][axis];
+        let (u, v) = ring_basis(axis);
+        let normal = [Vec3::X, Vec3::Y, Vec3::Z][axis];
         let (vx, vy, vw, vh) = self.viewport_px();
         let (cx, cy) = self.cursor_pos;
         let ndc_x = ((cx - vx) / vw) * 2.0 - 1.0;
@@ -4202,6 +4819,9 @@ impl State {
                 let id = e.id;
                 self.open_entity_document(id);
             }
+        }
+        if std::mem::take(&mut self.ui.content_import) {
+            self.import_assets();
         }
 
         // Inspector edits: apply live to the selected entity; record one undo
@@ -4586,6 +5206,7 @@ impl State {
                 self.selected = Some(idx);
             }
         }
+        let audio_status = self.audio_status();
 
         // Transient scene toast (mode switch, save, …) while its deadline holds.
         let toast_msg: Option<String> = self
@@ -4637,6 +5258,7 @@ impl State {
         let mut close_doc: Option<usize> = None;
         let mut open_doc_req: Option<PathBuf> = None;
         let mut close_docs_under: Option<PathBuf> = None;
+        let mut audio_req: Option<AudioReq> = None;
         let mut captured_scene_rect: Option<egui::Rect> = None;
         let mut captured_toolbar_rect: Option<egui::Rect> = None;
         let full_output = ctx.run(raw_input, |c| {
@@ -4673,10 +5295,24 @@ impl State {
                 &mut close_doc,
                 &mut open_doc_req,
                 &mut close_docs_under,
+                audio_status.clone(),
+                &mut audio_req,
                 &mut captured_scene_rect,
                 &mut captured_toolbar_rect,
             )
         });
+        if let Some(req) = audio_req {
+            match req {
+                AudioReq::Play(p) => self.audio_play(p),
+                AudioReq::Toggle => self.audio_toggle(),
+                AudioReq::Seek(s) => self.audio_seek(s),
+                AudioReq::Volume(v) => self.audio_volume(v),
+                AudioReq::Speed(s) => self.audio_speed(s),
+                AudioReq::ScrubStart => self.audio_scrub_start(),
+                AudioReq::ScrubTo(s) => self.audio_scrub_to(s),
+                AudioReq::ScrubEnd(s) => self.audio_scrub_end(s),
+            }
+        }
         self.scene_rect = captured_scene_rect;
         self.toolbar_rect = captured_toolbar_rect;
         if let Some(base) = close_docs_under {
@@ -4993,6 +5629,11 @@ impl ApplicationHandler for App {
                                 // A gizmo handle takes priority; otherwise orbit/select.
                                 if let Some(ax) = state.gizmo_handle_hit(state.cursor_pos) {
                                     state.gizmo_drag = Some(ax);
+                                    // Capture the rotate-grab angle so rotation is incremental.
+                                    if state.gizmo_mode == GizmoMode::Rotate {
+                                        state.gizmo_rot_prev =
+                                            state.cursor_ring_angle(ax).unwrap_or(0.0);
+                                    }
                                     // Capture scale-grab state so scaling is relative.
                                     if state.gizmo_mode == GizmoMode::Scale {
                                         if let (Some(i), Some((center, _))) =
