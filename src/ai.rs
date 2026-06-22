@@ -81,6 +81,7 @@ pub(crate) struct PendingCommand {
 /// A mutation the AI agent wants applied to the scene (executed on the main thread).
 pub(crate) enum SceneCommand {
     Add { x: f32, z: f32, color: [f32; 3] },
+    AddSphere { x: f32, z: f32, color: [f32; 3] },
     SetColor { index: usize, color: [f32; 3] },
     Remove { index: usize },
     Select { index: usize },
@@ -222,7 +223,7 @@ pub(crate) fn build_system_prompt(scene: &SceneSnapshot) -> String {
     let mut s = String::from(
         "You are CoE-AI, the assistant built into CoEngine, a 3D engine the user is building. \
 You can DIRECTLY change the 3D scene using the provided tools — when the user asks for a scene change \
-(add, recolor, remove, or select cubes), DO IT with the tools rather than describing code. After acting, \
+(add or recolor cubes and spheres, remove, or select objects), DO IT with the tools rather than describing code. After acting, \
 confirm in one short sentence. You also have a `run_command` tool that runs a shell command in the \
 engine's terminal (the user must approve each one) and returns its output — use it for git, file listing, \
 builds, and similar tasks.\n\n",
@@ -283,6 +284,30 @@ pub(crate) fn tools_json() -> serde_json::Value {
         {
             "name": "set_cube_color",
             "description": "Change the color of an existing cube, identified by its index.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "index": { "type": "integer" },
+                    "color": { "type": "string" }
+                },
+                "required": ["index", "color"]
+            }
+        },
+        {
+            "name": "add_sphere",
+            "description": "Add a sphere to the 3D scene (same size as a cube). Optionally give a color (a name like \"green\" or hex like \"#33cc44\") and an x/z position on the ground; if x/z are omitted the engine auto-places it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "color": { "type": "string" },
+                    "x": { "type": "number" },
+                    "z": { "type": "number" }
+                }
+            }
+        },
+        {
+            "name": "set_sphere_color",
+            "description": "Change the color of an existing object (cube or sphere), identified by its index.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -375,6 +400,32 @@ pub(crate) fn execute_tool(
                 format!("Cube #{idx} is now {color_name}.")
             } else {
                 format!("There is no cube #{idx} (the scene has {} cubes).", mirror.len())
+            }
+        }
+        "add_sphere" => {
+            let color_name = input.get("color").and_then(|c| c.as_str()).unwrap_or("orange");
+            let color = parse_color(color_name);
+            let n = mirror.len();
+            let (x, z) = match (
+                input.get("x").and_then(|v| v.as_f64()),
+                input.get("z").and_then(|v| v.as_f64()),
+            ) {
+                (Some(x), Some(z)) => (x as f32, z as f32),
+                _ => grid_slot(n),
+            };
+            mirror.push((x, z));
+            let _ = tx.send(StreamMsg::Command(SceneCommand::AddSphere { x, z, color }));
+            format!("Added a {color_name} sphere as #{n} at x={x:.1}, z={z:.1}.")
+        }
+        "set_sphere_color" => {
+            let idx = input.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+            let color_name = input.get("color").and_then(|c| c.as_str()).unwrap_or("orange");
+            if idx < mirror.len() {
+                let color = parse_color(color_name);
+                let _ = tx.send(StreamMsg::Command(SceneCommand::SetColor { index: idx, color }));
+                format!("Object #{idx} is now {color_name}.")
+            } else {
+                format!("There is no object #{idx} (the scene has {} objects).", mirror.len())
             }
         }
         "remove_cube" => {

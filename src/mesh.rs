@@ -27,12 +27,23 @@ impl Vertex {
     }
 }
 
-/// The shape an entity renders as. Only `Cube` for now; more primitives (and
-/// loaded meshes / 2D sprites) slot in here later without touching the model.
+/// The shape an entity renders as. More primitives (and loaded meshes / 2D
+/// sprites) slot in here later without touching the model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub(crate) enum ShapeKind {
     #[default]
     Cube,
+    Sphere,
+}
+
+impl ShapeKind {
+    /// Human label (also used to name new entities: "Cube 3", "Sphere 4").
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Cube => "Cube",
+            ShapeKind::Sphere => "Sphere",
+        }
+    }
 }
 
 fn vec3_one() -> Vec3 {
@@ -172,17 +183,62 @@ pub(crate) fn unit_cube() -> Vec<Vertex> {
     v
 }
 
-/// Build the scene's triangle vertices: each entity's unit cube transformed by
-/// its model matrix (position/rotation/scale) and tinted by its color, with the
-/// selected entity glowing cobalt.
+/// A unit sphere (radius `CUBE_HALF`, so its diameter matches the cube) as a
+/// triangle list. Per-vertex grayscale shade lives in `color` (like `unit_cube`'s
+/// per-face brightness) so `build_scene_vertices` can tint it by the entity color.
+pub(crate) fn unit_sphere() -> Vec<Vertex> {
+    let r = CUBE_HALF;
+    let stacks = 14usize; // latitude bands
+    let sectors = 20usize; // longitude segments
+    let pi = std::f32::consts::PI;
+    let light = Vec3::new(0.35, 1.0, 0.45).normalize();
+
+    // Unit normal (also the position direction) at a stack/sector grid point.
+    let dir = |st: usize, se: usize| -> Vec3 {
+        let phi = pi * (st as f32 / stacks as f32); // 0..pi  (north→south)
+        let theta = 2.0 * pi * (se as f32 / sectors as f32); // 0..2pi (around)
+        Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin())
+    };
+    // Soft top-down shade so the sphere reads as 3D (ambient floor + diffuse).
+    let vert = |n: Vec3| -> Vertex {
+        let s = 0.45 + 0.55 * n.dot(light).clamp(0.0, 1.0);
+        Vertex {
+            position: [n.x * r, n.y * r, n.z * r],
+            color: [s, s, s],
+        }
+    };
+
+    let mut v = Vec::with_capacity(stacks * sectors * 6);
+    for st in 0..stacks {
+        for se in 0..sectors {
+            let a = dir(st, se);
+            let b = dir(st + 1, se);
+            let c = dir(st + 1, se + 1);
+            let d = dir(st, se + 1);
+            for n in [a, b, c, a, c, d] {
+                v.push(vert(n));
+            }
+        }
+    }
+    v
+}
+
+/// Build the scene's triangle vertices: each entity's shape (cube or sphere)
+/// transformed by its model matrix (position/rotation/scale) and tinted by its
+/// color, with the selected entity glowing cobalt.
 pub(crate) fn build_scene_vertices(entities: &[Entity], selected: Option<usize>) -> Vec<Vertex> {
-    let base = unit_cube();
-    let mut out = Vec::with_capacity(entities.len() * base.len());
+    let cube = unit_cube();
+    let sphere = unit_sphere();
+    let mut out = Vec::new();
 
     for (i, e) in entities.iter().enumerate() {
         let highlight = Some(i) == selected;
         let model = e.model_matrix();
-        for v in &base {
+        let base = match e.kind {
+            ShapeKind::Cube => &cube,
+            ShapeKind::Sphere => &sphere,
+        };
+        for v in base {
             let shade = v.color[0]; // per-face grayscale brightness
             let color = if highlight {
                 // The selected entity glows cobalt (the engine identity color).

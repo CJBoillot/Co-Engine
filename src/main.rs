@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.20";
+pub(crate) const CO_VERSION: &str = "0.0.21";
 
 mod ai;
 use ai::*;
@@ -142,6 +142,8 @@ struct UiState {
     outliner_select: Option<usize>,
     outliner_delete: Option<usize>,
     outliner_add: bool,
+    /// Double-click in the outliner: open that object as its own document tab.
+    outliner_open: Option<usize>,
     /// Inspector edit requests: the edited entity (live) + a commit flag (undo).
     inspector_apply: Option<Entity>,
     inspector_commit: bool,
@@ -196,6 +198,7 @@ impl Default for UiState {
             outliner_select: None,
             outliner_delete: None,
             outliner_add: false,
+            outliner_open: None,
             inspector_apply: None,
             inspector_commit: false,
             gizmo_mode_req: None,
@@ -475,6 +478,7 @@ fn outliner_ui(
     select_req: &mut Option<usize>,
     delete_req: &mut Option<usize>,
     add_req: &mut bool,
+    open_req: &mut Option<usize>,
 ) {
     egui::TopBottomPanel::top("outliner_header").show_inside(ui, |ui| {
         ui.add_space(6.0);
@@ -500,11 +504,14 @@ fn outliner_ui(
             .show(ui, |ui| {
                 for (i, name) in names.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        if ui
+                        let resp = ui
                             .selectable_label(Some(i) == selected, name)
-                            .clicked()
-                        {
+                            .on_hover_text("Click to select · double-click to open in a tab");
+                        if resp.clicked() {
                             *select_req = Some(i);
+                        }
+                        if resp.double_clicked() {
+                            *open_req = Some(i);
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -872,6 +879,7 @@ struct EngineTabs<'a> {
     outliner_select: &'a mut Option<usize>,
     outliner_delete: &'a mut Option<usize>,
     outliner_add: &'a mut bool,
+    outliner_open: &'a mut Option<usize>,
     /// Inspector: the selected entity (clone) + edit out-params.
     inspector: Option<Entity>,
     inspector_apply: &'a mut Option<Entity>,
@@ -931,6 +939,7 @@ impl TabViewer for EngineTabs<'_> {
                     self.outliner_select,
                     self.outliner_delete,
                     self.outliner_add,
+                    self.outliner_open,
                 );
             }
             DockTab::Inspector => {
@@ -1090,6 +1099,13 @@ fn build_ui(
     pending_command: &mut Option<PendingCommand>,
     focus_restore: &mut Option<DockState<DockTab>>,
     dock_state: &mut DockState<DockTab>,
+    doc_titles: &[(String, bool)],
+    active_doc: usize,
+    active_doc_source: Option<DocSource>,
+    switch_doc: &mut Option<usize>,
+    close_doc: &mut Option<usize>,
+    open_doc_req: &mut Option<PathBuf>,
+    close_docs_under: &mut Option<PathBuf>,
     scene_rect_out: &mut Option<egui::Rect>,
     toolbar_rect_out: &mut Option<egui::Rect>,
 ) {
@@ -1198,17 +1214,16 @@ fn build_ui(
     // doesn't immediately close it again.
     let mut popup_just_opened = false;
 
-    // Active file + dirty flags (used by the top bar, status bar, and Ctrl+S).
-    let active_file: Option<PathBuf> = dock_state.find_active_focused().and_then(|(_, tab)| {
-        match tab {
-            DockTab::File(p) => Some(p.clone()),
-            _ => None,
-        }
-    });
+    // Active file + dirty flags (used by the top bar, status bar, and Ctrl+S) —
+    // the active document's file, if it's a file document.
+    let active_file: Option<PathBuf> = match &active_doc_source {
+        Some(DocSource::File(p)) => Some(p.clone()),
+        _ => None,
+    };
     let active_dirty = active_file
         .as_ref()
         .is_some_and(|p| file_cache.get(p).is_some_and(FileView::is_dirty));
-    let do_save = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
+    let mut do_save = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
     let do_save_all = false;
     let mut do_save_project = false;
     // Ctrl+P opens the command palette.
@@ -1264,6 +1279,38 @@ fn build_ui(
                 });
             });
         });
+
+    // Document tabs (below the top bar): Scene + any open file/asset editors, each
+    // a full workspace. Click to switch; × closes (Scene #0 is not closable).
+    egui::TopBottomPanel::top("doc_tabs").show(ctx, |ui| {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            for (i, (title, closable)) in doc_titles.iter().enumerate() {
+                let glyph = if i == 0 {
+                    theme::icon::SCENE
+                } else {
+                    theme::icon::FILE
+                };
+                if ui
+                    .selectable_label(i == active_doc, format!("{glyph}  {title}"))
+                    .clicked()
+                {
+                    *switch_doc = Some(i);
+                }
+                if *closable
+                    && ui
+                        .small_button(theme::icon::X)
+                        .on_hover_text("Close document")
+                        .clicked()
+                {
+                    *close_doc = Some(i);
+                }
+                ui.add_space(2.0);
+            }
+        });
+        ui.add_space(2.0);
+    });
 
     // Bottom status bar: git branch (left); caret position, active-file language,
     // and unsaved-file count (right). The caret is last frame's value (see the
@@ -1345,6 +1392,12 @@ fn build_ui(
             });
         });
     for tab in rail_clicks {
+        // Panels live in the Scene workspace — if a file/asset document is active,
+        // a rail click switches back to Scene rather than docking into that editor.
+        if active_doc != 0 {
+            *switch_doc = Some(0);
+            continue;
+        }
         // Clicking a rail icon while in Focus mode exits focus first.
         if let Some(saved) = focus_restore.take() {
             *dock_state = saved;
@@ -1357,7 +1410,7 @@ fn build_ui(
     }
 
     // Command palette (Ctrl+P / top-bar pill).
-    command_palette(ctx, ui_state, dock_state, project_path);
+    command_palette(ctx, ui_state, dock_state, project_path, open_doc_req);
 
     if do_save_project {
         ui_state.save_requested = true;
@@ -1418,7 +1471,76 @@ fn build_ui(
     let mut close_req: Option<DockTab> = None;
     // Recomputed each frame from whichever file editor has focus.
     ui_state.editor_cursor = None;
-    {
+    if let Some(DocSource::Entity(_)) = &active_doc_source {
+        // Object (entity) document: a focused editor for one object. Reuses the
+        // Inspector (the selected entity == this document's object) — name,
+        // position, rotation, scale, color — as a full-tab editor.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
+            inspector_ui(
+                ui,
+                inspector,
+                &mut ui_state.inspector_apply,
+                &mut ui_state.inspector_commit,
+            );
+        });
+    } else if let Some(DocSource::File(path)) = active_doc_source.clone() {
+        // File document: a focused editor with its own type toolbar and only the
+        // panels that object needs — no world panels, no inner dock tab bar.
+        let dirty = file_cache.get(&path).is_some_and(FileView::is_dirty);
+        egui::TopBottomPanel::top("object_toolbar").show(ctx, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(
+                        dirty,
+                        egui::Button::new(
+                            egui::RichText::new(format!("{}  Save", theme::icon::SAVE)).small(),
+                        ),
+                    )
+                    .clicked()
+                {
+                    do_save = true;
+                }
+                if ui
+                    .button(egui::RichText::new(format!("{}  Find", theme::icon::SEARCH)).small())
+                    .clicked()
+                {
+                    ui_state.find.open = true;
+                    ui_state.find.focus_query = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(language_for(&path).to_uppercase())
+                            .weak()
+                            .small(),
+                    );
+                });
+            });
+            ui.add_space(3.0);
+        });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let lang = language_for(&path);
+            let view = file_cache
+                .entry(path.clone())
+                .or_insert_with(|| load_file_view(ctx, &path));
+            let fq = if ui_state.find.open {
+                ui_state.find.query.as_str()
+            } else {
+                ""
+            };
+            file_view_ui(
+                ui,
+                view,
+                lang,
+                &mut ui_state.editor_cursor,
+                &mut ui_state.find_goto,
+                fq,
+            );
+        });
+    } else {
         let mut viewer = EngineTabs {
             chat,
             scene,
@@ -1442,6 +1564,7 @@ fn build_ui(
             outliner_select: &mut ui_state.outliner_select,
             outliner_delete: &mut ui_state.outliner_delete,
             outliner_add: &mut ui_state.outliner_add,
+            outliner_open: &mut ui_state.outliner_open,
             inspector: inspector.cloned(),
             inspector_apply: &mut ui_state.inspector_apply,
             inspector_commit: &mut ui_state.inspector_commit,
@@ -1486,10 +1609,10 @@ fn build_ui(
         }
     }
 
-    // A file was clicked in the Explorer: open (or focus) a viewer tab for it,
-    // docked in the same leaf as Logic (top-center) when Logic is present.
+    // A file was clicked in the Explorer: open it as its own document tab (handled
+    // by the caller, which owns the document list).
     if let Some(path) = open_file_req {
-        open_file_tab(dock_state, path);
+        *open_doc_req = Some(path);
     }
 
     // An Explorer right-click op was chosen: stage it in the modal (fresh, so any
@@ -1498,22 +1621,22 @@ fn build_ui(
         ui_state.fs_prompt = Some(req);
         ui_state.fs_prompt_error = None;
     }
-    // A tree item was dragged onto a folder: move it, syncing open tabs. A failed
-    // move (name conflict, into-itself) surfaces as a standalone error popup.
+    // A tree item was dragged onto a folder: move it, syncing open documents. A
+    // failed move (name conflict, into-itself) surfaces as a standalone error popup.
     if let Some((from, dest)) = fs_move_req {
         match move_into(&from, &dest) {
             Ok(Some((from, to))) => {
                 let was_file = to.is_file();
-                close_file_tabs(dock_state, file_cache, |p| path_is_within(p, &from));
+                *close_docs_under = Some(from);
                 if was_file {
-                    open_file_tab(dock_state, to);
+                    *open_doc_req = Some(to);
                 }
             }
             Ok(None) => {}
             Err(e) => ui_state.fs_prompt_error = Some(e),
         }
     }
-    service_fs_prompt(ctx, ui_state, file_cache, dock_state);
+    service_fs_prompt(ctx, ui_state, open_doc_req, close_docs_under);
 
     // Transient scene toast (camera mode switch, project save, …): top-center of
     // the viewport, gold-bordered, fades out when its deadline passes.
@@ -2118,45 +2241,6 @@ fn clicked_outside<R>(ctx: &egui::Context, inner: &Option<egui::InnerResponse<R>
         .is_some_and(|p| !ir.response.rect.contains(p))
 }
 
-/// Open (or focus) a viewer tab for `path`, docked in the same leaf as Logic
-/// (top-center) when Logic is present. Shared by the Explorer click handler and
-/// the "new file" op.
-fn open_file_tab(dock_state: &mut DockState<DockTab>, path: PathBuf) {
-    let tab = DockTab::File(path);
-    if let Some(loc) = dock_state.find_tab(&tab) {
-        dock_state.set_active_tab(loc);
-    } else {
-        if let Some((surface, node, _)) = dock_state.find_tab(&DockTab::Logic) {
-            dock_state.set_focused_node_and_surface((surface, node));
-        }
-        dock_state.push_to_focused_leaf(tab);
-    }
-}
-
-/// Close any open `File` viewer tabs whose path satisfies `pred` (used after a
-/// rename/delete so stale tabs don't linger), and drop their cached contents.
-fn close_file_tabs(
-    dock_state: &mut DockState<DockTab>,
-    file_cache: &mut HashMap<PathBuf, FileView>,
-    pred: impl Fn(&Path) -> bool,
-) {
-    let affected: Vec<DockTab> = dock_state
-        .iter_all_tabs()
-        .filter_map(|(_, t)| match t {
-            DockTab::File(p) if pred(p) => Some(DockTab::File(p.clone())),
-            _ => None,
-        })
-        .collect();
-    for tab in affected {
-        if let DockTab::File(p) = &tab {
-            file_cache.remove(p);
-        }
-        if let Some(loc) = dock_state.find_tab(&tab) {
-            dock_state.remove_tab(loc);
-        }
-    }
-}
-
 /// True if `p` is `base` itself or lives underneath it (so a folder rename/delete
 /// also catches the files open from inside it).
 fn path_is_within(p: &Path, base: &Path) -> bool {
@@ -2168,8 +2252,8 @@ fn path_is_within(p: &Path, base: &Path) -> bool {
 fn service_fs_prompt(
     ctx: &egui::Context,
     ui_state: &mut UiState,
-    file_cache: &mut HashMap<PathBuf, FileView>,
-    dock_state: &mut DockState<DockTab>,
+    open_doc_req: &mut Option<PathBuf>,
+    close_docs_under: &mut Option<PathBuf>,
 ) {
     if ui_state.fs_prompt.is_none() {
         // No naming modal open, but a drag-move may have failed — show it on its
@@ -2294,19 +2378,19 @@ fn service_fs_prompt(
     match run_fs_prompt(prompt) {
         Ok(outcome) => {
             match outcome {
-                FsOutcome::CreatedFile(p) => open_file_tab(dock_state, p),
+                FsOutcome::CreatedFile(p) => *open_doc_req = Some(p),
                 FsOutcome::CreatedFolder => {}
                 FsOutcome::Renamed { from, to } => {
-                    // Reopen a single renamed file at its new path; just close
-                    // anything affected for a folder rename.
+                    // Close the old document(s); reopen a single renamed file at
+                    // its new path.
                     let was_file = to.is_file();
-                    close_file_tabs(dock_state, file_cache, |p| path_is_within(p, &from));
+                    *close_docs_under = Some(from);
                     if was_file {
-                        open_file_tab(dock_state, to);
+                        *open_doc_req = Some(to);
                     }
                 }
                 FsOutcome::Deleted(target) => {
-                    close_file_tabs(dock_state, file_cache, |p| path_is_within(p, &target));
+                    *close_docs_under = Some(target);
                 }
             }
             ui_state.fs_prompt = None;
@@ -2334,6 +2418,7 @@ fn command_palette(
     ui_state: &mut UiState,
     dock_state: &mut DockState<DockTab>,
     project_root: Option<&Path>,
+    open_doc_req: &mut Option<PathBuf>,
 ) {
     if !ui_state.palette_open {
         return;
@@ -2437,7 +2522,7 @@ fn command_palette(
                     dock_state.push_to_focused_leaf(tab);
                 }
             }
-            PaletteAction::OpenFile(path) => open_file_tab(dock_state, path),
+            PaletteAction::OpenFile(path) => *open_doc_req = Some(path),
             PaletteAction::SaveProject => ui_state.save_requested = true,
             PaletteAction::Settings => ui_state.settings_open = true,
         }
@@ -2952,6 +3037,21 @@ fn fallback_dock_state() -> DockState<DockTab> {
     state
 }
 
+/// What an open document edits. Scene is tab #0 (not a `Document`); the rest are
+/// either a file/asset editor or an object (entity) editor.
+#[derive(Clone)]
+enum DocSource {
+    File(PathBuf),
+    Entity(u32),
+}
+
+/// One open document beyond the Scene, shown as its own top-level tab and rendered
+/// as a focused editor (file editor, or object/entity editor).
+struct Document {
+    title: String,
+    source: DocSource,
+}
+
 // ---------------------------------------------------------------------------
 // Renderer state
 // ---------------------------------------------------------------------------
@@ -3063,8 +3163,13 @@ struct State {
     /// Session action log + undo/redo history (newest last; cursor = current state).
     history: Vec<HistoryEntry>,
     history_cursor: usize,
-    /// Dockable workspace layout + the 3D Scene tab's rect (in egui points).
+    /// The Scene document's dockable workspace layout (document tab #0). Other
+    /// open documents (file/asset editors) live in `extra_docs`.
     dock_state: DockState<DockTab>,
+    /// Additional open documents shown as top-level tabs after Scene.
+    extra_docs: Vec<Document>,
+    /// Active document tab: 0 = Scene (`dock_state`), n = `extra_docs[n-1]`.
+    active_doc: usize,
     scene_rect: Option<egui::Rect>,
     /// The CoE logo as an egui texture (None if assets/icon.png is missing).
     logo_texture: Option<egui::TextureHandle>,
@@ -3379,6 +3484,8 @@ impl State {
             }],
             history_cursor: 0,
             dock_state: build_dock_state(),
+            extra_docs: Vec::new(),
+            active_doc: 0,
             scene_rect: None,
             logo_texture,
             splash_texture,
@@ -3443,24 +3550,100 @@ impl State {
         );
     }
 
+    /// Open `path` as its own document tab (or focus it if already open).
+    fn open_document(&mut self, path: PathBuf) {
+        if let Some(i) = self.extra_docs.iter().position(
+            |d| matches!(&d.source, DocSource::File(p) if p.as_path() == path.as_path()),
+        ) {
+            self.active_doc = i + 1;
+            return;
+        }
+        let title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.extra_docs.push(Document {
+            title,
+            source: DocSource::File(path),
+        });
+        self.active_doc = self.extra_docs.len(); // Scene is 0, so the new doc is len.
+    }
+
+    /// Open object (entity) `id` as its own document tab (or focus it if open).
+    fn open_entity_document(&mut self, id: u32) {
+        if let Some(i) = self
+            .extra_docs
+            .iter()
+            .position(|d| matches!(d.source, DocSource::Entity(e) if e == id))
+        {
+            self.active_doc = i + 1;
+            return;
+        }
+        let title = self
+            .entities
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| format!("Object {id}"));
+        self.extra_docs.push(Document {
+            title,
+            source: DocSource::Entity(id),
+        });
+        self.active_doc = self.extra_docs.len();
+    }
+
+    /// Close any document whose file is at/under `base` (after a rename/delete) and
+    /// drop the cached contents. Falls back to the Scene tab if the active doc went.
+    fn close_documents_under(&mut self, base: &Path) {
+        let before = self.extra_docs.len();
+        self.extra_docs.retain(
+            |d| !matches!(&d.source, DocSource::File(p) if path_is_within(p, base)),
+        );
+        self.file_cache.retain(|p, _| !path_is_within(p, base));
+        if self.extra_docs.len() != before {
+            self.active_doc = 0;
+        }
+    }
+
+    /// Drop any object documents whose entity no longer exists, and refresh titles
+    /// from live entity names. Keeps `active_doc` valid.
+    fn sync_entity_documents(&mut self) {
+        let entities = &self.entities;
+        let before = self.extra_docs.len();
+        self.extra_docs.retain(|d| match &d.source {
+            DocSource::Entity(id) => entities.iter().any(|e| e.id == *id),
+            _ => true,
+        });
+        for d in &mut self.extra_docs {
+            if let DocSource::Entity(id) = d.source {
+                if let Some(e) = entities.iter().find(|e| e.id == id) {
+                    d.title = e.name.clone();
+                }
+            }
+        }
+        if self.extra_docs.len() != before && self.active_doc > self.extra_docs.len() {
+            self.active_doc = 0;
+        }
+    }
+
     /// Build a fresh entity with the next id and a default name/transform.
-    fn new_entity(&mut self, pos: Vec3, color: [f32; 3]) -> Entity {
+    fn new_entity(&mut self, pos: Vec3, color: [f32; 3], kind: ShapeKind) -> Entity {
         let id = self.next_id;
         self.next_id += 1;
         Entity {
             id,
-            name: format!("Object {id}"),
+            name: format!("{} {id}", kind.label()),
             pos,
             rotation: Vec3::ZERO,
             scale: Vec3::ONE,
             color,
-            kind: ShapeKind::Cube,
+            kind,
         }
     }
 
     fn add_cube(&mut self) {
         let (x, z) = grid_slot(self.entities.len());
-        let e = self.new_entity(Vec3::new(x, CUBE_HALF, z), CUBE_BASE_COLOR);
+        let e = self.new_entity(Vec3::new(x, CUBE_HALF, z), CUBE_BASE_COLOR, ShapeKind::Cube);
         self.entities.push(e);
         self.rebuild_cubes();
         self.record_history("Add cube");
@@ -3796,6 +3979,8 @@ impl State {
         self.controls = p.controls;
         self.ui.shell = p.shell;
         self.dock_state = p.dock_state;
+        self.extra_docs.clear();
+        self.active_doc = 0;
         // Loading a project leaves Focus mode (the manifest holds the full layout).
         self.focus_restore = None;
         // Drop all terminals so new ones open in the loaded project's folder.
@@ -3925,6 +4110,8 @@ impl State {
         self.selected = None;
         self.rebuild_cubes();
         self.dock_state = build_dock_state();
+        self.extra_docs.clear();
+        self.active_doc = 0;
         self.history = vec![HistoryEntry {
             label: "New project".to_string(),
             at: Instant::now(),
@@ -4009,6 +4196,12 @@ impl State {
         }
         if std::mem::take(&mut self.ui.outliner_add) {
             self.add_cube();
+        }
+        if let Some(i) = self.ui.outliner_open.take() {
+            if let Some(e) = self.entities.get(i) {
+                let id = e.id;
+                self.open_entity_document(id);
+            }
         }
 
         // Inspector edits: apply live to the selected entity; record one undo
@@ -4214,9 +4407,15 @@ impl State {
             for cmd in commands {
                 match cmd {
                     SceneCommand::Add { x, z, color } => {
-                        let e = self.new_entity(Vec3::new(x, CUBE_HALF, z), color);
+                        let e = self.new_entity(Vec3::new(x, CUBE_HALF, z), color, ShapeKind::Cube);
                         self.entities.push(e);
                         self.record_history("CoE-AI: add cube");
+                    }
+                    SceneCommand::AddSphere { x, z, color } => {
+                        let e =
+                            self.new_entity(Vec3::new(x, CUBE_HALF, z), color, ShapeKind::Sphere);
+                        self.entities.push(e);
+                        self.record_history("CoE-AI: add sphere");
                     }
                     SceneCommand::SetColor { index, color } => {
                         if index < self.entities.len() {
@@ -4369,6 +4568,25 @@ impl State {
         // --- egui UI over the scene ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
+
+        // Resolve the active document (before borrowing self for the UI). Prune
+        // object docs for deleted entities + refresh titles; for an object doc,
+        // select its entity so the shared Inspector / edit plumbing targets it.
+        self.sync_entity_documents();
+        if self.active_doc > self.extra_docs.len() {
+            self.active_doc = 0;
+        }
+        let active_doc_source: Option<DocSource> = if self.active_doc == 0 {
+            None
+        } else {
+            Some(self.extra_docs[self.active_doc - 1].source.clone())
+        };
+        if let Some(DocSource::Entity(id)) = &active_doc_source {
+            if let Some(idx) = self.entities.iter().position(|e| e.id == *id) {
+                self.selected = Some(idx);
+            }
+        }
+
         // Transient scene toast (mode switch, save, …) while its deadline holds.
         let toast_msg: Option<String> = self
             .toast
@@ -4400,7 +4618,25 @@ impl State {
         let controls = &self.controls;
         let history = &self.history;
         let history_cursor = self.history_cursor;
-        let dock_state = &mut self.dock_state;
+        // Document tabs: Scene (#0) + any open file/asset documents.
+        let mut doc_titles: Vec<(String, bool)> = vec![("Scene".to_string(), false)];
+        for d in &self.extra_docs {
+            let dirty = matches!(&d.source, DocSource::File(p) if file_cache.get(p).is_some_and(FileView::is_dirty));
+            let title = if dirty {
+                format!("● {}", d.title)
+            } else {
+                d.title.clone()
+            };
+            doc_titles.push((title, true));
+        }
+        let active_doc = self.active_doc;
+        let dock_state = {
+            &mut self.dock_state
+        };
+        let mut switch_doc: Option<usize> = None;
+        let mut close_doc: Option<usize> = None;
+        let mut open_doc_req: Option<PathBuf> = None;
+        let mut close_docs_under: Option<PathBuf> = None;
         let mut captured_scene_rect: Option<egui::Rect> = None;
         let mut captured_toolbar_rect: Option<egui::Rect> = None;
         let full_output = ctx.run(raw_input, |c| {
@@ -4430,12 +4666,38 @@ impl State {
                 pending_command,
                 focus_restore,
                 dock_state,
+                &doc_titles,
+                active_doc,
+                active_doc_source.clone(),
+                &mut switch_doc,
+                &mut close_doc,
+                &mut open_doc_req,
+                &mut close_docs_under,
                 &mut captured_scene_rect,
                 &mut captured_toolbar_rect,
             )
         });
         self.scene_rect = captured_scene_rect;
         self.toolbar_rect = captured_toolbar_rect;
+        if let Some(base) = close_docs_under {
+            self.close_documents_under(&base);
+        }
+        if let Some(path) = open_doc_req {
+            self.open_document(path);
+        }
+        if let Some(i) = switch_doc {
+            self.active_doc = i;
+        }
+        if let Some(i) = close_doc {
+            if i >= 1 && i - 1 < self.extra_docs.len() {
+                self.extra_docs.remove(i - 1);
+                if self.active_doc == i {
+                    self.active_doc = i - 1;
+                } else if self.active_doc > i {
+                    self.active_doc -= 1;
+                }
+            }
+        }
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
