@@ -38,6 +38,15 @@ impl Shell {
             Shell::Cmd => "Command Prompt (cmd)",
         }
     }
+
+    /// Short tab label.
+    pub(crate) fn short(self) -> &'static str {
+        match self {
+            Shell::PowerShell => "powershell",
+            Shell::Pwsh => "pwsh",
+            Shell::Cmd => "cmd",
+        }
+    }
 }
 
 /// Run a one-shot command through the chosen shell in `cwd`, capturing
@@ -184,12 +193,42 @@ impl Drop for TerminalSession {
     }
 }
 
-/// Lifecycle of the Terminal tab's shell (lazily started the first time the tab
-/// is shown, so we don't spawn a shell unless the terminal is actually used).
+/// Lifecycle of one terminal's shell (lazily started the first time it's shown,
+/// so we don't spawn a shell unless the terminal is actually used).
 pub(crate) enum TerminalState {
     Off,
     Running(TerminalSession),
     Failed(String),
+}
+
+/// One terminal in the panel: a title, its shell, and its live session.
+pub(crate) struct TermInstance {
+    pub(crate) title: String,
+    pub(crate) shell: Shell,
+    pub(crate) state: TerminalState,
+}
+
+/// The Terminal tab now hosts many terminals (Cursor/VS Code-style): a tab strip
+/// with a "+" shell picker, plus the active terminal's live grid.
+#[derive(Default)]
+pub(crate) struct TerminalPanel {
+    pub(crate) items: Vec<TermInstance>,
+    pub(crate) active: usize,
+    /// Monotonic counter for unique tab titles ("powershell 1", "powershell 2"…).
+    created: usize,
+}
+
+impl TerminalPanel {
+    /// Add a new (lazily-spawned) terminal for `shell` and focus it.
+    fn add(&mut self, shell: Shell) {
+        self.created += 1;
+        self.items.push(TermInstance {
+            title: format!("{} {}", shell.short(), self.created),
+            shell,
+            state: TerminalState::Off,
+        });
+        self.active = self.items.len() - 1;
+    }
 }
 
 const TERM_BG: egui::Color32 = egui::Color32::from_rgb(16, 16, 20);
@@ -284,10 +323,72 @@ fn translate_terminal_input(events: &[egui::Event]) -> Vec<u8> {
     out
 }
 
-/// Render the Terminal tab: start the shell on first show; draw the live colored
-/// grid + cursor; resize the PTY to the tab; route keystrokes to the shell when
-/// the terminal has focus (click to focus).
-pub(crate) fn terminal_tab_ui(ui: &mut egui::Ui, term: &mut TerminalState, cwd: Option<&Path>, shell: &str) {
+/// The Terminal tab: a tab strip of terminals (with a "+" shell picker) over the
+/// active terminal's live grid. Lazily creates the first terminal on show.
+pub(crate) fn terminal_panel_ui(
+    ui: &mut egui::Ui,
+    panel: &mut TerminalPanel,
+    cwd: Option<&Path>,
+    default_shell: Shell,
+) {
+    if panel.items.is_empty() {
+        panel.add(default_shell);
+    }
+    let mut close: Option<usize> = None;
+    let mut add: Option<Shell> = None;
+    egui::TopBottomPanel::top("terminal_tabs").show_inside(ui, |ui| {
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            for i in 0..panel.items.len() {
+                let active = i == panel.active;
+                if ui
+                    .selectable_label(active, &panel.items[i].title)
+                    .clicked()
+                {
+                    panel.active = i;
+                }
+                if ui
+                    .small_button(crate::theme::icon::X)
+                    .on_hover_text("Close terminal")
+                    .clicked()
+                {
+                    close = Some(i);
+                }
+                ui.add_space(2.0);
+            }
+            ui.menu_button(crate::theme::icon::PLUS, |ui| {
+                for sh in [Shell::PowerShell, Shell::Pwsh, Shell::Cmd] {
+                    if ui.button(sh.label()).clicked() {
+                        add = Some(sh);
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("New terminal");
+        });
+        ui.add_space(3.0);
+    });
+    if let Some(sh) = add {
+        panel.add(sh);
+    }
+    if let Some(i) = close {
+        panel.items.remove(i); // Drop kills the shell process
+        if panel.active >= panel.items.len() {
+            panel.active = panel.items.len().saturating_sub(1);
+        }
+    }
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        if let Some(item) = panel.items.get_mut(panel.active) {
+            let shell_cmd = item.shell.command();
+            terminal_instance_ui(ui, &mut item.state, cwd, shell_cmd);
+        }
+    });
+}
+
+/// Render one terminal: start the shell on first show; draw the live colored grid
+/// + cursor; resize the PTY to the area; route keystrokes when focused.
+fn terminal_instance_ui(ui: &mut egui::Ui, term: &mut TerminalState, cwd: Option<&Path>, shell: &str) {
     match term {
         TerminalState::Off => {
             *term = match TerminalSession::spawn(shell, cwd) {

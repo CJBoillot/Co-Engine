@@ -46,7 +46,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// CoSemVer display version (see memory: CoSemVer). A trailing letter marks a
 /// bug fix for this version. Kept separate from Cargo's strict-SemVer `version`.
-pub(crate) const CO_VERSION: &str = "0.0.19";
+pub(crate) const CO_VERSION: &str = "0.0.20";
 
 mod ai;
 use ai::*;
@@ -855,10 +855,10 @@ struct EngineTabs<'a> {
     fs_move_req: &'a mut Option<(PathBuf, PathBuf)>,
     /// Decoded file contents for `File` viewer tabs, keyed by path (lazy-loaded).
     file_cache: &'a mut HashMap<PathBuf, FileView>,
-    /// The in-engine terminal's shell session (lazily started).
-    terminal: &'a mut TerminalState,
-    /// The shell executable to launch for the terminal.
-    terminal_shell: String,
+    /// The in-engine terminal panel (multiple terminals, lazily started).
+    terminal: &'a mut TerminalPanel,
+    /// Default shell for new terminals (from Settings).
+    terminal_shell: Shell,
     /// Git panel state.
     git: &'a mut GitUi,
     /// Set to a tab when its eye (Focus toggle) is clicked; handled after the pass.
@@ -963,11 +963,11 @@ impl TabViewer for EngineTabs<'_> {
                 self.redo_req,
             ),
             DockTab::Terminal => {
-                terminal_tab_ui(
+                terminal_panel_ui(
                     ui,
                     self.terminal,
                     self.project_root.as_deref(),
-                    &self.terminal_shell,
+                    self.terminal_shell,
                 );
             }
             DockTab::Git => {
@@ -1085,7 +1085,7 @@ fn build_ui(
     project_path: Option<&Path>,
     project_dirty: bool,
     file_cache: &mut HashMap<PathBuf, FileView>,
-    terminal: &mut TerminalState,
+    terminal: &mut TerminalPanel,
     git: &mut GitUi,
     pending_command: &mut Option<PendingCommand>,
     focus_restore: &mut Option<DockState<DockTab>>,
@@ -1433,7 +1433,7 @@ fn build_ui(
             fs_move_req: &mut fs_move_req,
             file_cache,
             terminal: &mut *terminal,
-            terminal_shell: ui_state.shell.command().to_string(),
+            terminal_shell: ui_state.shell,
             git: &mut *git,
             focus_req: &mut focus_req,
             close_req: &mut close_req,
@@ -1937,14 +1937,11 @@ fn build_ui(
                                 for sh in [Shell::PowerShell, Shell::Pwsh, Shell::Cmd] {
                                     ui.selectable_value(&mut ui_state.shell, sh, sh.label());
                                 }
-                                if ui_state.shell != before {
-                                    // Restart the terminal with the newly chosen shell.
-                                    *terminal = TerminalState::Off;
-                                }
+                                let _ = before;
                                 ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new(
-                                        "Changing the shell restarts the Terminal.",
+                                        "New terminals use this shell (open one with + in the Terminal).",
                                     )
                                     .small()
                                     .italics(),
@@ -3086,8 +3083,8 @@ struct State {
     startup_last_project: Option<PathBuf>,
     /// Lazy cache of decoded file contents for open `File` viewer tabs.
     file_cache: HashMap<PathBuf, FileView>,
-    /// The in-engine terminal's shell (lazily started when the tab is shown).
-    terminal: TerminalState,
+    /// The in-engine terminal panel (multiple terminals, lazily started).
+    terminal: TerminalPanel,
     /// Git (Source Control) panel state.
     git: GitUi,
     /// A terminal command CoE-AI proposed, awaiting the user's approve/deny.
@@ -3391,7 +3388,7 @@ impl State {
             project_path: None,
             startup_last_project,
             file_cache: HashMap::new(),
-            terminal: TerminalState::Off,
+            terminal: TerminalPanel::default(),
             git: GitUi::default(),
             pending_command: None,
             focus_restore: None,
@@ -3801,8 +3798,8 @@ impl State {
         self.dock_state = p.dock_state;
         // Loading a project leaves Focus mode (the manifest holds the full layout).
         self.focus_restore = None;
-        // Restart the terminal so it uses the loaded project's shell.
-        self.terminal = TerminalState::Off;
+        // Drop all terminals so new ones open in the loaded project's folder.
+        self.terminal = TerminalPanel::default();
 
         // The loaded scene becomes the new history baseline (undo can't go past it).
         self.history = vec![HistoryEntry {
